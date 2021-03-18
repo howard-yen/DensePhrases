@@ -64,7 +64,6 @@ train-single:
 		--learning_rate $(LR) \
 		--num_train_epochs 2.0 \
 		--max_seq_length $(MAX_SEQ_LEN) \
-		--fp16 \
 		--lambda_kl $(LAMBDA_KL) \
 		--lambda_neg $(LAMBDA_NEG) \
 		--lambda_flt 1.0 \
@@ -102,7 +101,6 @@ train-single-nq: model-name nq-single-data nq-param pbn-param
 		OPTIONS='$(PBN_OPTIONS) --do_dump --load_dir $(DPH_SAVE_DIR)/$(MODEL_NAME)_tmp'
 	make index-sod
 	make eval-sod SOD_DATA=$(SOD_DATA) OPTIONS=$(OPTIONS)
-
 # Create IVFSQ index for Semi-OD
 index-sod: model-name
 	python -m densephrases.experiments.create_index \
@@ -316,6 +314,45 @@ eval-od: dump-dir model-name nq-open-data
 		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
 		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
 		$(OPTIONS)
+
+eval-bert: dump-dir model-name nq-open-data
+	python -m densephrases.experiments.run_open \
+		--run_mode eval_results_bert \
+		--model_type bert \
+		--pretrained_name_or_path SpanBERT/spanbert-base-cased \
+		--cuda \
+		--debug \
+		--eval_batch_size 12 \
+		--dump_dir $(DUMP_DIR) \
+		--index_dir start/1048576_flat_PQ96_8 \
+		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
+		$(OPTIONS)
+
+# Train the bert model used for reranking
+train-bert: nq-single-data nq-param pbn-param
+	python -i -m densephrases.experiments.run_open \
+		--run_mode train_bert \
+		--cuda \
+		--model_type bert \
+		--pretrained_name_or_path SpanBERT/spanbert-base-cased \
+		--data_dir $(DPH_DATA_DIR)/single-qa \
+		--cache_dir $(DPH_CACHE_DIR) \
+		--train_file $(TRAIN_DATA) \
+		--predict_file $(DEV_DATA) \
+		--per_gpu_train_batch_size $(BS) \
+		--learning_rate $(LR) \
+		--num_train_epochs 2.0 \
+		--fp16 \
+		--append_title \
+		--output_dir $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--index_dir start/1048576_flat_PQ96_8 \
+		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
+		--top_k 10 \
+		--per_gpu_train_batch_size 25 \
+		$(OPTIONS) 
+		#--load_dir $(DPH_SAVE_DIR)/bert_reranking_tmp' \
 
 train-query: dump-dir model-name nq-open-data
 	python -m densephrases.experiments.run_open \
