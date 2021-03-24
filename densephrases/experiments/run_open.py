@@ -1,7 +1,7 @@
 import json
 import argparse
 import torch
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 import os
 import random
 import numpy as np
@@ -459,7 +459,88 @@ def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
 
     return
 
-def train_bert(args, mips=None, query_encoder=None):
+def process_reader_input(args, tokenizer, train_file=None):
+    logger.info(f'Loading reader input dataset from {args.train_file}')
+    with open(train_file if train_file else args.train_file, encoding='utf-8') as f:
+        data = json.load(f)['data']
+
+    all_input_ids = []
+    all_token_type_ids = []
+    all_attention_mask = []
+    all_start_pos = []
+    all_end_pos = []
+    all_is_impossible = []
+
+    for sample in tqdm(data):
+        question = sample['question']
+        answer = sample['answer']
+        predictions = sample['prediction']
+        titles = sample['title']
+        evidences = sample['evidence']
+        start_pos = sample['start_pos']
+        end_pos = sample['end_pos']
+        is_impossible = sample['is_impossible']
+        is_impossible = [1 if imp else 0 for imp in is_impossible]
+
+        input_ids = []
+        token_type_ids = []
+        attention_mask = []
+        starts = []
+        ends = []
+
+        question_tokens = tokenizer.tokenize(question)
+        for pred_idx, pred in enumerate(predictions):
+            title_tokens = tokenizer.tokenize(titles[pred_idx])
+            front_tokens = question_tokens + ['[SEP]'] + title_tokens #should i be adding SEP between questiona and title?
+
+            # get the start and ending token index for the answer
+            if is_impossible[pred_idx]:
+                back_tokens = tokenizer.tokenize(evidences[pred_idx])
+                starts.append(-1)
+                ends.append(-1)
+            else:
+                before_answer = tokenizer.tokenize(evidences[pred_idx][0:start_pos[pred_idx]-1])
+                answer_tokens = tokenizer.tokenize(evidences[pred_idx][start_pos[pred_idx]:end_pos[pred_idx]+1])
+                after_answer = tokenizer.tokenize(evidences[pred_idx][end_pos[pred_idx]+1:])
+                back_tokens = before_answer + answer_tokens + after_answer
+                starts.append(len(front_tokens) + len(before_answer) + 1)
+                ends.append(len(front_tokens) + len(before_answer) + len(answer_tokens))
+
+            encoded = tokenizer.encode_plus(front_tokens, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+
+            input_ids.append(encoded['input_ids'])
+            token_type_ids.append(encoded['token_type_ids'])
+            attention_mask.append(encoded['attention_mask'])
+
+        # need to pad so ensure the same size in every dimension
+        for extra in range(len(predictions), 10):
+            input_ids.append([0 for i in range(384)])
+            token_type_ids.append([0 for i in range(384)])
+            attention_mask.append([0 for i in range(384)])
+            starts.append(-1)
+            ends.append(-1)
+            is_impossible.append(-1)
+
+        all_input_ids.append(input_ids)
+        all_token_type_ids.append(token_type_ids)
+        all_attention_mask.append(attention_mask)
+        all_start_pos.append(starts)
+        all_end_pos.append(ends)
+        all_is_impossible.append(is_impossible)
+
+    all_input_ids = torch.tensor(all_input_ids).to(device=args.device)
+    all_token_type_ids = torch.tensor(all_token_type_ids).to(device=args.device)
+    all_attention_mask = torch.tensor(all_attention_mask).to(device=args.device)
+    all_start_pos = torch.tensor(all_start_pos).to(device=args.device)
+    all_end_pos = torch.tensor(all_end_pos).to(device=args.device)
+    all_is_impossible = torch.tensor(all_is_impossible).to(device=args.device)
+
+    dataset = TensorDataset(all_input_ids, all_token_type_ids, all_attention_mask, all_start_pos, all_end_pos, all_is_impossible)
+
+    return dataset
+
+
+def train_bert(args):
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or not args.cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
@@ -472,27 +553,14 @@ def train_bert(args, mips=None, query_encoder=None):
     args.device = device
 
     logger.info('Training BERT model used for reranking')
-    config = AutoConfig.from_pretrained('./outputs/spanbert-base-cased-sqdnq')
-    tokenizer = AutoTokenizer.from_pretrained('./outputs/spanbert-base-cased-sqdnq')
+    config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cahce_dir if args.cache_dir else None)
 
-    logger.info('Loaded the training examples')
-
-    dataset, examples, features = load_and_cache_examples(args, tokenizer=tokenizer, output_examples=True)
-
-    if mips is None:
-        mips = load_phrase_index(args)
-
-    if query_encoder is None:
-        print(f'Query encoder will be loaded from {args.query_encoder_path}')
-        device = 'cuda' if args.cuda else 'cpu'
-        query_encoder, tokenizer = load_query_encoder(device, args)
-
-    questions = examples[ex.question_text for ex in examples]
-    query_vec = embed_all_query(questions, args, query_encoder, tokenizer)
+    train_dataset = process_reader_input(args, tokenizer)
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     model = Reader(config=config, tokenizer=tokenizer)
     model.to(device)
@@ -563,7 +631,7 @@ def train_bert(args, mips=None, query_encoder=None):
 
     # Train!
     logger.info("***** Running training *****")
-    logger.info("  Num examples = %d", len(dataset))
+    logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
     logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
     logger.info(
@@ -622,44 +690,11 @@ def train_bert(args, mips=None, query_encoder=None):
                 "token_type_ids": batch[2],
                 "start_positions": batch[3],
                 "end_positions": batch[4],
-                "input_ids_": batch[8],
-                "attention_mask_": batch[9],
-                "token_type_ids_": batch[10],
+                "is_impossible": batch[5],
+                #"input_ids_": batch[8],
+                #"attention_mask_": batch[9],
+                #"token_type_ids_": batch[10],
             }
-
-            ## need more input pre-processing here: distantly supervised labeling
-            example_index = [] # need to figure out how to get this
-
-            # get the top k phrases for each query in the batch
-            queries = []
-            q_texts = []
-            answers = []
-            for ex_idx in example_index:
-                queries.append(query_vec[ex_idx])
-                q_texts.append(questions[ex_idx])
-                answer.append(examples[ex_idx].answer_text)
-
-            result = mips.search(queries, q_texts=q_texts, nprobe=args.nprobe, top_k=args.top_k, max_answer_length=args.max_answer_length)
-
-            prediction = [[ret['answer'] for ret in out] if len(out) > 0 else [''] for out in result]
-            evidence = [[ret['context'] for ret in out] if len(out) > 0 else [''] for out in result]
-            title = [[ret['title'] for ret in out] if len(out) > 0 else [['']] for out in result]
-            score = [[ret['score'] for ret in out] if len(out) > 0 else [-1e10] for out in result]
-
-            start_positions = []
-            end_positions = []
-            # label each of the evidence
-            # each question can have multiple evidences and
-            # each evidence can have multiple exact matches
-            for answer in answers:
-                starts = []
-                ends = []
-                for evi in evidence:
-                    exact_matches = re.finditer(re.escape(answer), evi)
-                    starts.append([m.start() for m in exact_matches])
-                    ends.append([m.end() for m in exact_matches])
-                start_positions.append(starts)
-                end_positions.append(ends)
 
             loss = model(**inputs)
             epoch_iterator.set_description(f"Loss={loss.item():.3f}")

@@ -329,8 +329,23 @@ eval-bert: dump-dir model-name nq-open-data
 		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
 		$(OPTIONS)
 
+# get the predictions from a training file, 
+# same as eval-od but TRAIN_DATA instead
+get-predictions: dump-dir model-name nq-open-data
+	python -m densephrases.experiments.run_open \
+		--run_mode eval_inmemory \
+		--model_type bert \
+		--pretrained_name_or_path SpanBERT/spanbert-base-cased \
+		--cuda \
+		--eval_batch_size 12 \
+		--dump_dir $(DUMP_DIR) \
+		--index_dir start/1048576_flat_PQ96_8 \
+		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--test_path $(DPH_DATA_DIR)/$(TRAIN_DATA) \
+		$(OPTIONS)
+
 # Train the bert model used for reranking
-train-bert: nq-single-data nq-param pbn-param
+train-bert: nq-open-data nq-param pbn-param
 	python -i -m densephrases.experiments.run_open \
 		--run_mode train_bert \
 		--cuda \
@@ -338,7 +353,7 @@ train-bert: nq-single-data nq-param pbn-param
 		--pretrained_name_or_path SpanBERT/spanbert-base-cased \
 		--data_dir $(DPH_DATA_DIR)/single-qa \
 		--cache_dir $(DPH_CACHE_DIR) \
-		--train_file $(TRAIN_DATA) \
+		--train_file tqa_ds_train.json \
 		--predict_file $(DEV_DATA) \
 		--per_gpu_train_batch_size $(BS) \
 		--learning_rate $(LR) \
