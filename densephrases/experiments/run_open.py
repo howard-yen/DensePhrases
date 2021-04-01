@@ -488,7 +488,11 @@ def process_reader_input(args, tokenizer, train_file=None):
         starts = []
         ends = []
 
+        # limit query length
         question_tokens = tokenizer.tokenize(question)
+        if len(question_tokens) > args.max_query_length:
+            question_tokens = question_tokens[0:args.max_query_length]
+
         for pred_idx, pred in enumerate(predictions):
             title_tokens = tokenizer.tokenize(titles[pred_idx])
             front_tokens = question_tokens + ['[SEP]'] + title_tokens #should i be adding SEP between questiona and title?
@@ -496,15 +500,18 @@ def process_reader_input(args, tokenizer, train_file=None):
             # get the start and ending token index for the answer
             if is_impossible[pred_idx]:
                 back_tokens = tokenizer.tokenize(evidences[pred_idx])
-                starts.append(-1)
-                ends.append(-1)
+                # the cls token should be the first token by default, can check later
+                starts.append(0)
+                ends.append(0)
             else:
                 before_answer = tokenizer.tokenize(evidences[pred_idx][0:start_pos[pred_idx]-1])
                 answer_tokens = tokenizer.tokenize(evidences[pred_idx][start_pos[pred_idx]:end_pos[pred_idx]+1])
                 after_answer = tokenizer.tokenize(evidences[pred_idx][end_pos[pred_idx]+1:])
                 back_tokens = before_answer + answer_tokens + after_answer
-                starts.append(len(front_tokens) + len(before_answer) + 1)
-                ends.append(len(front_tokens) + len(before_answer) + len(answer_tokens))
+
+                # there's a [SEP] token between front and back tokens
+                starts.append(len(front_tokens) + 1 + len(before_answer) + 1)
+                ends.append(len(front_tokens) + 1 + len(before_answer) + len(answer_tokens))
 
             encoded = tokenizer.encode_plus(front_tokens, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
 
@@ -513,10 +520,10 @@ def process_reader_input(args, tokenizer, train_file=None):
             attention_mask.append(encoded['attention_mask'])
 
         # need to pad so ensure the same size in every dimension
-        for extra in range(len(predictions), 10):
-            input_ids.append([0 for i in range(384)])
-            token_type_ids.append([0 for i in range(384)])
-            attention_mask.append([0 for i in range(384)])
+        for extra in range(len(predictions), args.top_k):
+            input_ids.append([0 for i in range(args.max_seq_length)])
+            token_type_ids.append([0 for i in range(args.max_seq_length)])
+            attention_mask.append([0 for i in range(args.max_seq_length)])
             starts.append(-1)
             ends.append(-1)
             is_impossible.append(-1)
@@ -562,7 +569,7 @@ def train_bert(args):
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
-    model = Reader(config=config, tokenizer=tokenizer)
+    model = Reader(config=config)
     model.to(device)
 
     # Optimizer setting
@@ -675,7 +682,6 @@ def train_bert(args):
 
         epoch_iterator = tqdm(dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
-
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
                 steps_trained_in_current_epoch -= 1
@@ -686,15 +692,48 @@ def train_bert(args):
 
             inputs = {
                 "input_ids": batch[0],
-                "attention_mask": batch[1],
-                "token_type_ids": batch[2],
+                "token_type_ids": batch[1],
+                "attention_mask": batch[2],
                 "start_positions": batch[3],
                 "end_positions": batch[4],
                 "is_impossible": batch[5],
+                "rank": batch[6],
                 #"input_ids_": batch[8],
                 #"attention_mask_": batch[9],
                 #"token_type_ids_": batch[10],
             }
+
+            # skip this batch if none of the questions have a good passage
+            if inputs[rank].max() == -1:
+                continue
+
+            N = inputs['is_impossible'].size(0)
+            # in batch negatives
+            for im_idx, im in enumerate(inputs['is_impossible']):
+                # can fill with negative example if didn't have passage
+                # can change to only have one positive passage during training
+                replace_count = torch.nelement(im[im==-1])
+                if replace_count == 0:
+                    continue
+                # for now, assume batch_size >= top_k
+                replacements = torch.randperm(N-1)
+                replacements[replacements >= im_idx] += 1
+
+                input_temp = inputs['input_ids'][im_idx][0]
+                type_temp = inputs['token_type_ids'][im_idx][0]
+                question_str = input_temp[type_temp == 0]
+                question_str = tokenizer.decode(question_str.tolist())
+
+                for rep_idx, rep in enumerate(replacements):
+                    input_temp = inputs['inputs_ids'][rep][0]
+                    type_temp = inputs['token_type_ids'][rep][0]
+                    passage_str = input_temp[type_temp == 1]
+                    passage_str = tokenizer.decode(question_str.tolist())
+                    new_encoded = tokenizer.encode_plus(question_str, text_pair=question_str, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+                    inputs['input_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['input_ids']).to(device)
+                    inputs['token_type_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['token_type_ids']).to(device)
+                    inputs['attention_mask'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['attention_mask']).to(device)
+
 
             loss = model(**inputs)
             epoch_iterator.set_description(f"Loss={loss.item():.3f}")

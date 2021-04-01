@@ -27,13 +27,13 @@ from densephrases.utils.eval_utils import drqa_exact_match_score, drqa_regex_mat
 # fix random seed
 random.seed(0)
 
-def find_substring_and_return_random_idx(substring, string):
+def find_substring_and_return_first(substring, string):
     substring_idxs = [m.start() for m in re.finditer(re.escape(substring), string)]
-    substring_idx = random.choice(substring_idxs)
+    # substring_idx = random.choice(substring_idxs)
+    substring_idx = substring_idxs[0]
     return substring_idx
 
 def main(args):
-    print("loading input data")
     with open(args.input_path, encoding='utf-8') as f:
         data = json.load(f)
 
@@ -48,6 +48,15 @@ def main(args):
         predictions = sample['prediction'][0:args.top_k]
         titles = sample['title'][0:args.top_k]
         evidences = sample['evidence'][0:args.top_k]
+        scores = sample['score'][0:args.top_k]
+
+        # each question has at least one prediction
+        if len(predictions) < args.top_k:
+            count += 1
+            if len(predictions) < min_pred:
+                min_pred = len(predictions)
+            if len(predictions) == 0:
+                zeros += 1
 
         is_impossible = []
         start_pos = []
@@ -64,7 +73,7 @@ def main(args):
         for pred_idx, pred in enumerate(predictions):
             if pred != "" and drqa_metric_max_over_ground_truths(match_fn, pred, answers):
                 is_impossible.append(False)
-                answer_start = find_substring_and_return_random_idx(pred, evidences[pred_idx])
+                answer_start = find_substring_and_return_first(pred, evidences[pred_idx])
                 start_pos.append(answer_start)
                 end_pos.append(answer_start + len(pred)-1)
             else:
@@ -81,14 +90,14 @@ def main(args):
                 'evidence': evidences,
                 'is_impossible': is_impossible,
                 'start_pos': start_pos,
-                'end_pos': end_pos
+                'end_pos': end_pos,
+                'score': scores,
                 })
 
     with open(args.output_path, 'w', encoding='utf-8') as f:
         json.dump({
             'data': output_data
         },f)
-
 
 # ------------------------------------------------------------------------------
 # Main.

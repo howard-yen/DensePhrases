@@ -24,7 +24,7 @@ class Reader(nn.Module):
 
     # perform one forward step of the model that maps the input ids to a start and end position for each passage and also select one passage among all the passages in each example in the batch
     # size of the input should be N batch size x M candidates per batch x L length of each candidate (question + title + evidence passage)
-    def forward(self, input_ids, attention_mask=None, token_type_ids=None, start_positions=None, end_positions=None, is_impossible=None):
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, start_positions=None, end_positions=None, is_impossible=None, best_passage=None):
         N, M, L = input_ids.size()
         # sequence_output = N*M x L x hidden_size
         # pooled_output = N*M x hidden_size
@@ -38,52 +38,37 @@ class Reader(nn.Module):
         start_pos = start_pos.squeeze(-1)
         end_pos = end_pos.squeeze(-1)
 
-        # clamp is just relu but set max to ignored_index
-        ignored_index = start_pos.size(1)
-        #start_pos.clamp_(0,ignored_index)
-        #end_pos.clamp_(0, ignored_index)
-        #relu = nn.ReLU()
-        #start_pos = relu(start_pos)
-        #end_pos = relu(end_pos)
-
         # N*M x 1, only consider the first token([CLS]) to determine the rank
         ranks = self.qa_classifier(sequence_output[:, 0, :])
         ranks = ranks.squeeze(-1)
-        #ranks.clamp_(0, ignored_index)
-        #ranks = relu(ranks)
 
-        softmax = nn.Softmax(dim=-1)
-        start_pos = softmax(start_pos)
-        end_pos = softmax(end_pos)
-        ranks = softmax(ranks.view(N, M))
+        softmax = nn.LogSoftmax(dim=-1)
+        start_logits = softmax(start_pos)
+        end_logits = softmax(end_pos)
+        rank_logits = softmax(ranks.view(N, M))
 
         if self.training:
-            return self.compute_loss(start_pos, end_pos, ranks, start_positions, end_positions, is_impossible, N, M, L)
+            return self.compute_loss(start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, best_passage, N, M, L)
 
-        return start_pos, end_pos, ranks
+        return start_logits.view(N, M, L), end_logits.view(N, M, L), rank_logits.view(N, M)
 
-    def compute_loss(self, start_pos, end_pos, ranks, start_positions, end_positions, is_impossible, N, M, L):
-        logger.info('computing loss')
-        #still not sure why dpr used ignored_index
-        ignored_index = start_pos.size(1)
-        #dpr uses crossentropy with L number of classes, but for now we use 1 for should select and 0 for shouldn't select
-        cel = nn.BCELoss()
+    def compute_loss(self, start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, best_passage, N, M, L):
+        ignore_index = -1
+        nll = nn.NLLLoss(ignore_index=ignore_index)
 
-        #need to do to device
-        start_zeroes = torch.zeros(start_pos.size())
-        end_zeroes = torch.zeros(end_pos.size())
-        for i in range(N):
-            for j in range(M):
-                start_zeroes[i*N + j][start_positions[i][j]] = 1
-                end_zeroes[i*N + j][end_positions[i][j]] = 1
+        start_positions = start_positions.view(N * M)
+        end_positions = end_positions.view(N * M)
 
-        start_loss = cel(start_pos, start_zeroes)
-        end_loss = cel(end_pos, end_zeroes)
+        start_positions.clamp_(0, L-1)
+        end_positions.clamp_(0, L-1)
 
-        # need to change because -1 means there wasn't a prediction
-        is_impossible[is_impossible==-1] = 0
-        is_impossible = is_impossible.to(dtype=torch.float)
-        passage_loss = cel(ranks, is_impossible.view(ranks.size()))
+        start_loss = nll(start_logits, start_positions)
+        end_loss = nll(start_logits, start_positions)
+
+        rank_logits = rank_logits.view(N, M)
+
+        # questions with no good passage has -1, which is ignored
+        rank_loss = nll(rank_logits, best_passage)
 
         return start_loss + end_loss + passage_loss
 
@@ -99,8 +84,9 @@ def process_reader_input(tokenizer, train_file=None):
     all_start_pos = []
     all_end_pos = []
     all_is_impossible = []
+    all_best_passage = []
 
-    for sample in tqdm(data):
+    for sample_idx, sample in enumerate(tqdm(data)):
         question = sample['question']
         answer = sample['answer']
         predictions = sample['prediction']
@@ -108,6 +94,8 @@ def process_reader_input(tokenizer, train_file=None):
         evidences = sample['evidence']
         start_pos = sample['start_pos']
         end_pos = sample['end_pos']
+        scores = sample['score']
+
         is_impossible = sample['is_impossible']
         is_impossible = [1 if imp else 0 for imp in is_impossible]
 
@@ -116,24 +104,42 @@ def process_reader_input(tokenizer, train_file=None):
         attention_mask = []
         starts = []
         ends = []
+        best = -1
 
         question_tokens = tokenizer.tokenize(question)
+        if len(question_tokens) > 64:
+            question_tokens = question_tokens[0:64]
+
         for pred_idx, pred in enumerate(predictions):
             title_tokens = tokenizer.tokenize(titles[pred_idx])
-            front_tokens = question_tokens + ['[SEP]'] + title_tokens #should i be adding SEP between questiona and title?
+            front_tokens = question_tokens # + ['[SEP]'] + title_tokens
+            # CLS + 2 SEP
+            before_passage_length = len(question_tokens) + len(title_tokens) + 3
 
             # get the start and ending token index for the answer
             if is_impossible[pred_idx]:
                 back_tokens = tokenizer.tokenize(evidences[pred_idx])
-                starts.append(-1)
-                ends.append(-1)
+                # CLS token is at index 0 and represents the no answer token
+                starts.append(0)
+                ends.append(0)
             else:
                 before_answer = tokenizer.tokenize(evidences[pred_idx][0:start_pos[pred_idx]-1])
                 answer_tokens = tokenizer.tokenize(evidences[pred_idx][start_pos[pred_idx]:end_pos[pred_idx]+1])
                 after_answer = tokenizer.tokenize(evidences[pred_idx][end_pos[pred_idx]+1:])
                 back_tokens = before_answer + answer_tokens + after_answer
-                starts.append(len(front_tokens) + len(before_answer) + 1)
-                ends.append(len(front_tokens) + len(before_answer) + len(answer_tokens))
+
+                # before passage + before answer + answer token length must be smaller than args.max_seq_length or the reader won't be able to even see it
+                if before_passage_length + len(before_answer) + len(answer_tokens) <= 384:
+                    starts.append(before_passage_length + len(before_answer) + 1)
+                    ends.append(before_passage_length + len(before_answer) + len(answer_tokens))
+                    if best == -1:
+                        best = pred_idx
+                else:
+                    starts.append(0)
+                    ends.append(0)
+                    is_impossible[pred_idx] = 1
+
+            back_tokens = title_tokens + ['[SEP]'] + back_tokens
 
             encoded = tokenizer.encode_plus(front_tokens, text_pair=back_tokens, max_length=384, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
 
@@ -142,8 +148,8 @@ def process_reader_input(tokenizer, train_file=None):
             attention_mask.append(encoded['attention_mask'])
 
         # need to pad so ensure the same size in every dimension
+        # use negative samples from other passages
         for extra in range(len(predictions), 10):
-            # maybe can use the no answer token after implementing that
             input_ids.append([0 for i in range(384)])
             token_type_ids.append([0 for i in range(384)])
             attention_mask.append([0 for i in range(384)])
@@ -157,6 +163,7 @@ def process_reader_input(tokenizer, train_file=None):
         all_start_pos.append(starts)
         all_end_pos.append(ends)
         all_is_impossible.append(is_impossible)
+        all_best_passage.append(best)
 
     device = 'cuda'
     all_input_ids = torch.tensor(all_input_ids)
@@ -165,8 +172,9 @@ def process_reader_input(tokenizer, train_file=None):
     all_start_pos = torch.tensor(all_start_pos)
     all_end_pos = torch.tensor(all_end_pos)
     all_is_impossible = torch.tensor(all_is_impossible)
+    all_best_passage = torch.tensor(all_best_passage)
 
-    dataset = TensorDataset(all_input_ids, all_token_type_ids, all_attention_mask, all_start_pos, all_end_pos, all_is_impossible)
+    dataset = TensorDataset(all_input_ids, all_token_type_ids, all_attention_mask, all_start_pos, all_end_pos, all_is_impossible, all_best_passage)
 
     return dataset
 
