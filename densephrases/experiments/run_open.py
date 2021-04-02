@@ -17,7 +17,7 @@ from time import time
 from tqdm import tqdm, trange
 
 from densephrases.models import DensePhrases, MIPS, MIPSLight
-from densephrases.utils.single_utils import backward_compat
+from densephrases.utils.single_utils import set_seed, to_list, to_numpy, backward_compat
 from densephrases.utils.squad_utils import get_question_dataloader, TrueCaser
 import densephrases.utils.squad_utils as squad_utils
 from densephrases.utils.embed_utils import get_question_results
@@ -460,9 +460,9 @@ def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
     return
 
 def process_reader_input(args, tokenizer, train_file=None):
-    logger.info(f'Loading reader input dataset from {args.train_file}')
-    with open(train_file if train_file else args.train_file, encoding='utf-8') as f:
-        data = json.load(f)['data']
+    logger.info(f'Loading reader input dataset from {train_file if train_file is not None else args.train_file}')
+    with open(train_file if train_file is not None else args.train_file, encoding='utf-8') as f:
+        data = json.load(f)['data'][0:1000]
 
     all_input_ids = []
     all_token_type_ids = []
@@ -470,8 +470,9 @@ def process_reader_input(args, tokenizer, train_file=None):
     all_start_pos = []
     all_end_pos = []
     all_is_impossible = []
+    all_best_passage = []
 
-    for sample in tqdm(data):
+    for sample_idx, sample in enumerate(tqdm(data)):
         question = sample['question']
         answer = sample['answer']
         predictions = sample['prediction']
@@ -479,6 +480,8 @@ def process_reader_input(args, tokenizer, train_file=None):
         evidences = sample['evidence']
         start_pos = sample['start_pos']
         end_pos = sample['end_pos']
+        scores = sample['score']
+
         is_impossible = sample['is_impossible']
         is_impossible = [1 if imp else 0 for imp in is_impossible]
 
@@ -487,20 +490,22 @@ def process_reader_input(args, tokenizer, train_file=None):
         attention_mask = []
         starts = []
         ends = []
+        best = -1
 
-        # limit query length
         question_tokens = tokenizer.tokenize(question)
         if len(question_tokens) > args.max_query_length:
             question_tokens = question_tokens[0:args.max_query_length]
 
         for pred_idx, pred in enumerate(predictions):
             title_tokens = tokenizer.tokenize(titles[pred_idx])
-            front_tokens = question_tokens + ['[SEP]'] + title_tokens #should i be adding SEP between questiona and title?
+            front_tokens = question_tokens # + ['[SEP]'] + title_tokens
+            # CLS + 2 SEP
+            before_passage_length = len(question_tokens) + len(title_tokens) + 3
 
             # get the start and ending token index for the answer
             if is_impossible[pred_idx]:
                 back_tokens = tokenizer.tokenize(evidences[pred_idx])
-                # the cls token should be the first token by default, can check later
+                # CLS token is at index 0 and represents the no answer token
                 starts.append(0)
                 ends.append(0)
             else:
@@ -509,9 +514,18 @@ def process_reader_input(args, tokenizer, train_file=None):
                 after_answer = tokenizer.tokenize(evidences[pred_idx][end_pos[pred_idx]+1:])
                 back_tokens = before_answer + answer_tokens + after_answer
 
-                # there's a [SEP] token between front and back tokens
-                starts.append(len(front_tokens) + 1 + len(before_answer) + 1)
-                ends.append(len(front_tokens) + 1 + len(before_answer) + len(answer_tokens))
+                # before passage + before answer + answer token length must be smaller than args.max_seq_length or the reader won't be able to even see it
+                if before_passage_length + len(before_answer) + len(answer_tokens) <= args.max_seq_length:
+                    starts.append(before_passage_length + len(before_answer) + 1)
+                    ends.append(before_passage_length + len(before_answer) + len(answer_tokens))
+                    if best == -1:
+                        best = pred_idx
+                else:
+                    starts.append(0)
+                    ends.append(0)
+                    is_impossible[pred_idx] = 1
+
+            back_tokens = title_tokens + ['[SEP]'] + back_tokens
 
             encoded = tokenizer.encode_plus(front_tokens, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
 
@@ -520,12 +534,13 @@ def process_reader_input(args, tokenizer, train_file=None):
             attention_mask.append(encoded['attention_mask'])
 
         # need to pad so ensure the same size in every dimension
+        # replaced by negative sample in batch while training
         for extra in range(len(predictions), args.top_k):
             input_ids.append([0 for i in range(args.max_seq_length)])
             token_type_ids.append([0 for i in range(args.max_seq_length)])
             attention_mask.append([0 for i in range(args.max_seq_length)])
-            starts.append(-1)
-            ends.append(-1)
+            starts.append(0)
+            ends.append(0)
             is_impossible.append(-1)
 
         all_input_ids.append(input_ids)
@@ -534,15 +549,17 @@ def process_reader_input(args, tokenizer, train_file=None):
         all_start_pos.append(starts)
         all_end_pos.append(ends)
         all_is_impossible.append(is_impossible)
+        all_best_passage.append(best)
 
-    all_input_ids = torch.tensor(all_input_ids).to(device=args.device)
-    all_token_type_ids = torch.tensor(all_token_type_ids).to(device=args.device)
-    all_attention_mask = torch.tensor(all_attention_mask).to(device=args.device)
-    all_start_pos = torch.tensor(all_start_pos).to(device=args.device)
-    all_end_pos = torch.tensor(all_end_pos).to(device=args.device)
-    all_is_impossible = torch.tensor(all_is_impossible).to(device=args.device)
+    all_input_ids = torch.tensor(all_input_ids)
+    all_token_type_ids = torch.tensor(all_token_type_ids)
+    all_attention_mask = torch.tensor(all_attention_mask)
+    all_start_pos = torch.tensor(all_start_pos)
+    all_end_pos = torch.tensor(all_end_pos)
+    all_is_impossible = torch.tensor(all_is_impossible)
+    all_best_passage = torch.tensor(all_best_passage)
 
-    dataset = TensorDataset(all_input_ids, all_token_type_ids, all_attention_mask, all_start_pos, all_end_pos, all_is_impossible)
+    dataset = TensorDataset(all_input_ids, all_token_type_ids, all_attention_mask, all_start_pos, all_end_pos, all_is_impossible, all_best_passage)
 
     return dataset
 
@@ -561,7 +578,7 @@ def train_bert(args):
 
     logger.info('Training BERT model used for reranking')
     config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cahce_dir if args.cache_dir else None)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
 
     train_dataset = process_reader_input(args, tokenizer)
 
@@ -680,7 +697,7 @@ def train_bert(args):
     for ep_idx, _ in enumerate(train_iterator):
         logger.info(f"\n[Epoch {ep_idx+1}]")
 
-        epoch_iterator = tqdm(dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
@@ -689,6 +706,8 @@ def train_bert(args):
 
             model.train()
             batch = tuple(t.to(device) for t in batch)
+
+            os.system('nvidia-smi')
 
             inputs = {
                 "input_ids": batch[0],
@@ -704,15 +723,16 @@ def train_bert(args):
             }
 
             # skip this batch if none of the questions have a good passage
-            if inputs[rank].max() == -1:
+            if inputs['rank'].max() == -1:
                 continue
 
             N = inputs['is_impossible'].size(0)
             # in batch negatives
             for im_idx, im in enumerate(inputs['is_impossible']):
+                logger.info('doing in-batch negatives')
                 # can fill with negative example if didn't have passage
                 # can change to only have one positive passage during training
-                replace_count = torch.nelement(im[im==-1])
+                replace_count = torch.numel(im[im==-1])
                 if replace_count == 0:
                     continue
                 # for now, assume batch_size >= top_k
@@ -725,16 +745,19 @@ def train_bert(args):
                 question_str = tokenizer.decode(question_str.tolist())
 
                 for rep_idx, rep in enumerate(replacements):
-                    input_temp = inputs['inputs_ids'][rep][0]
+                    if rep_idx >= replace_count:
+                        break
+
+                    input_temp = inputs['input_ids'][rep][0]
                     type_temp = inputs['token_type_ids'][rep][0]
                     passage_str = input_temp[type_temp == 1]
-                    passage_str = tokenizer.decode(question_str.tolist())
+                    passage_str = tokenizer.decode(passage_str.tolist())
                     new_encoded = tokenizer.encode_plus(question_str, text_pair=question_str, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
                     inputs['input_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['input_ids']).to(device)
                     inputs['token_type_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['token_type_ids']).to(device)
                     inputs['attention_mask'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['attention_mask']).to(device)
 
-
+            logger.info('calculating loss')
             loss = model(**inputs)
             epoch_iterator.set_description(f"Loss={loss.item():.3f}")
 
@@ -1140,6 +1163,11 @@ if __name__ == '__main__':
         "--version_2_with_negative",
         action="store_true",
         help="If true, the SQuAD examples contain some that do not have an answer.",
+    )
+    parser.add_argument(
+        "--evaluate_during_trining",
+        action="store_true",
+        help="If true, evaulate the model during training.",
     )
     parser.add_argument(
         "--load_dir",

@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import BertTokenizer, BertModel, BertForMaskedLM, AutoTokenizer, AutoConfig, AutoModel
 import json
 from tqdm import tqdm
+import os
 
 import logging
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
@@ -12,7 +13,6 @@ logger = logging.getLogger(__name__)
 class Reader(nn.Module):
     def __init__(self, config):
         super(Reader, self).__init__()
-
         logger.info('loading model')
         # load the model used for reading
         self.model = AutoModel.from_pretrained('outputs/spanbert-base-cased-sqdnq', config=config)
@@ -24,8 +24,11 @@ class Reader(nn.Module):
 
     # perform one forward step of the model that maps the input ids to a start and end position for each passage and also select one passage among all the passages in each example in the batch
     # size of the input should be N batch size x M candidates per batch x L length of each candidate (question + title + evidence passage)
-    def forward(self, input_ids, attention_mask=None, token_type_ids=None, start_positions=None, end_positions=None, is_impossible=None, best_passage=None):
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, start_positions=None, end_positions=None, is_impossible=None, rank=None):
         N, M, L = input_ids.size()
+
+        logger.info('running forward')
+
         # sequence_output = N*M x L x hidden_size
         # pooled_output = N*M x hidden_size
         # hidden_states = (N*M x L x hidden_size, N*M x L x hidden_size)
@@ -48,11 +51,11 @@ class Reader(nn.Module):
         rank_logits = softmax(ranks.view(N, M))
 
         if self.training:
-            return self.compute_loss(start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, best_passage, N, M, L)
+            return self.compute_loss(start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, rank, N, M, L)
 
         return start_logits.view(N, M, L), end_logits.view(N, M, L), rank_logits.view(N, M)
 
-    def compute_loss(self, start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, best_passage, N, M, L):
+    def compute_loss(self, start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, rank, N, M, L):
         ignore_index = -1
         nll = nn.NLLLoss(ignore_index=ignore_index)
 
@@ -68,15 +71,15 @@ class Reader(nn.Module):
         rank_logits = rank_logits.view(N, M)
 
         # questions with no good passage has -1, which is ignored
-        rank_loss = nll(rank_logits, best_passage)
+        rank_loss = nll(rank_logits, rank)
 
-        return start_loss + end_loss + passage_loss
+        return start_loss + end_loss + rank_loss
 
 # for testing, delete later
 def process_reader_input(tokenizer, train_file=None):
     logger.info(f'Loading reader input dataset from {train_file}')
     with open(train_file, encoding='utf-8') as f:
-        data = json.load(f)['data'][0:10]
+        data = json.load(f)['data'][0:100]
 
     all_input_ids = []
     all_token_type_ids = []
@@ -165,7 +168,6 @@ def process_reader_input(tokenizer, train_file=None):
         all_is_impossible.append(is_impossible)
         all_best_passage.append(best)
 
-    device = 'cuda'
     all_input_ids = torch.tensor(all_input_ids)
     all_token_type_ids = torch.tensor(all_token_type_ids)
     all_attention_mask = torch.tensor(all_attention_mask)
@@ -184,7 +186,9 @@ if __name__ == '__main__':
     config = AutoConfig.from_pretrained('outputs/spanbert-base-cased-sqdnq', output_hidden_states=True)
     tokenizer = AutoTokenizer.from_pretrained('outputs/spanbert-base-cased-sqdnq')
 
+    device = 'cuda'
     model = Reader(config=config)
+    model.to(device)
     args = {'train_file': 'tqa_ds_train.json'}
 
     logger.info('loading dataset')
@@ -194,7 +198,19 @@ if __name__ == '__main__':
     model.train()
 
     for batch in dataloader:
-        b = batch
-
-    logger.info('running on one batch')
-    start_loss, end_loss, passage_loss = model(b[0], b[2], b[1], b[3], b[4], b[5])
+        batch = tuple(t.to(device) for t in batch)
+        inputs = {
+            "input_ids": batch[0],
+            "token_type_ids": batch[1],
+            "attention_mask": batch[2],
+            "start_positions": batch[3],
+            "end_positions": batch[4],
+            "is_impossible": batch[5],
+            "rank": batch[6],
+            #"input_ids_": batch[8],
+            #"attention_mask_": batch[9],
+            #"token_type_ids_": batch[10],
+        }
+        #loss = model(**inputs)
+        #print(loss)
+        sequence_output, pooled_output, hidden_states = model.model(input_ids=inputs['input_ids'].view(-1, 384), attention_mask=inputs['attention_mask'].view(-1, 384), token_type_ids=inputs['token_type_ids'].view(-1, 384))

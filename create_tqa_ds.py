@@ -50,14 +50,6 @@ def main(args):
         evidences = sample['evidence'][0:args.top_k]
         scores = sample['score'][0:args.top_k]
 
-        # each question has at least one prediction
-        if len(predictions) < args.top_k:
-            count += 1
-            if len(predictions) < min_pred:
-                min_pred = len(predictions)
-            if len(predictions) == 0:
-                zeros += 1
-
         is_impossible = []
         start_pos = []
         end_pos = []
