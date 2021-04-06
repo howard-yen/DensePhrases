@@ -346,7 +346,7 @@ get-predictions: dump-dir model-name nq-open-data
 
 # Train the bert model used for reranking
 train-bert: nq-open-data nq-param pbn-param
-	python -i -m densephrases.experiments.run_open \
+	python -m densephrases.experiments.run_open \
 		--run_mode train_bert \
 		--cuda \
 		--model_type bert \
@@ -361,13 +361,15 @@ train-bert: nq-open-data nq-param pbn-param
 		--fp16 \
 		--append_title \
 		--output_dir $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--load_dir $(DPH_SAVE_DIR)/$(MODEL_NAME) \
 		--index_dir start/1048576_flat_PQ96_8 \
 		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
 		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
 		--top_k 10 \
-		--per_gpu_train_batch_size 25 \
+		--per_gpu_train_batch_size 1 \
+		--save_steps 5000 \
+		--wandb \
 		$(OPTIONS) 
-		#--load_dir $(DPH_SAVE_DIR)/bert_reranking_tmp' \
 
 train-query: dump-dir model-name nq-open-data
 	python -m densephrases.experiments.run_open \

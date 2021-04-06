@@ -415,8 +415,22 @@ def evaluate_results_kilt(predictions, qids, questions, answers, args, evidences
 
 
 def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
-    qids, questions, answers = load_qa_pairs(args.test_path, args)
+    # Setup CUDA, GPU & distributed evaluation
+    if args.local_rank == -1 or not args.cuda:
+        device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+        args.n_gpu = 0 if not args.cuda else torch.cuda.device_count()
+    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend="nccl")
+        args.n_gpu = 1
+    args.device = device
 
+    config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+
+
+    qids, questions, answers = load_qa_pairs(args.test_path, args)
     if query_encoder is None:
         print(f'Query encoder will be loaded from {args.query_encoder_path}')
         device = 'cuda' if args.cuda else 'cpu'
@@ -457,12 +471,14 @@ def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
 
     logger.info(f'Reranking using BERT model')
 
+
+
     return
 
 def process_reader_input(args, tokenizer, train_file=None):
     logger.info(f'Loading reader input dataset from {train_file if train_file is not None else args.train_file}')
     with open(train_file if train_file is not None else args.train_file, encoding='utf-8') as f:
-        data = json.load(f)['data'][0:1000]
+        data = json.load(f)['data']
 
     all_input_ids = []
     all_token_type_ids = []
@@ -565,6 +581,10 @@ def process_reader_input(args, tokenizer, train_file=None):
 
 
 def train_bert(args):
+    #wandb setup
+    wandb.init(project="DensePhrases-Reader-Training", entity='howard-yen', mode="online" if args.wandb else "disabled")
+    wandb.config.update(args)
+
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or not args.cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
@@ -576,9 +596,21 @@ def train_bert(args):
         args.n_gpu = 1
     args.device = device
 
+    torch.cuda.empty_cache()
+
     logger.info('Training BERT model used for reranking')
     config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+
+    model = Reader(config=config)
+    model.to(device)
+
+    # Check if saved model states exist
+    if args.load_dir:
+        if os.path.isfile(os.path.join(args.load_dir, "reader_model.pt")):
+            # Load in optimizer and scheduler states
+            model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
+            logger.info(f'model loaded from {args.load_dir}')
 
     train_dataset = process_reader_input(args, tokenizer)
 
@@ -586,8 +618,6 @@ def train_bert(args):
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
-    model = Reader(config=config)
-    model.to(device)
 
     # Optimizer setting
     def is_train_param(name):
@@ -604,7 +634,6 @@ def train_bert(args):
         args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
     else:
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
-
 
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [{
@@ -627,14 +656,14 @@ def train_bert(args):
     )
 
     # Check if saved optimizer or scheduler states exist
-    if args.output_dir:
-        if os.path.isfile(os.path.join(args.output_dir, "optimizer.pt")) and os.path.isfile(
-            os.path.join(args.output_dir, "scheduler.pt")
+    if args.load_dir:
+        if os.path.isfile(os.path.join(args.load_dir, "optimizer.pt")) and os.path.isfile(
+            os.path.join(args.load_dir, "scheduler.pt")
         ):
             # Load in optimizer and scheduler states
-            optimizer.load_state_dict(torch.load(os.path.join(args.output_dir, "optimizer.pt")))
-            scheduler.load_state_dict(torch.load(os.path.join(args.output_dir, "scheduler.pt")))
-            logger.info(f'optimizer and scheduler loaded from {args.output_dir}')
+            optimizer.load_state_dict(torch.load(os.path.join(args.load_dir, "optimizer.pt")))
+            scheduler.load_state_dict(torch.load(os.path.join(args.load_dir, "scheduler.pt")))
+            logger.info(f'optimizer and scheduler loaded from {args.load_dir}')
 
     if args.fp16:
         try:
@@ -705,9 +734,10 @@ def train_bert(args):
                 continue
 
             model.train()
-            batch = tuple(t.to(device) for t in batch)
 
-            os.system('nvidia-smi')
+            torch.cuda.empty_cache()
+
+            batch = tuple(t.to(device) for t in batch)
 
             inputs = {
                 "input_ids": batch[0],
@@ -728,36 +758,35 @@ def train_bert(args):
 
             N = inputs['is_impossible'].size(0)
             # in batch negatives
-            for im_idx, im in enumerate(inputs['is_impossible']):
-                logger.info('doing in-batch negatives')
-                # can fill with negative example if didn't have passage
-                # can change to only have one positive passage during training
-                replace_count = torch.numel(im[im==-1])
-                if replace_count == 0:
-                    continue
-                # for now, assume batch_size >= top_k
-                replacements = torch.randperm(N-1)
-                replacements[replacements >= im_idx] += 1
+            #for im_idx, im in enumerate(inputs['is_impossible']):
+            #    logger.info('doing in-batch negatives')
+            #    # can fill with negative example if didn't have passage
+            #    # can change to only have one positive passage during training
+            #    replace_count = torch.numel(im[im==-1])
+            #    if replace_count == 0:
+            #        continue
+            #    # for now, assume batch_size >= top_k
+            #    replacements = torch.randperm(N-1)
+            #    replacements[replacements >= im_idx] += 1
 
-                input_temp = inputs['input_ids'][im_idx][0]
-                type_temp = inputs['token_type_ids'][im_idx][0]
-                question_str = input_temp[type_temp == 0]
-                question_str = tokenizer.decode(question_str.tolist())
+            #    input_temp = inputs['input_ids'][im_idx][0]
+            #    type_temp = inputs['token_type_ids'][im_idx][0]
+            #    question_str = input_temp[type_temp == 0]
+            #    question_str = tokenizer.decode(question_str.tolist())
 
-                for rep_idx, rep in enumerate(replacements):
-                    if rep_idx >= replace_count:
-                        break
+            #    for rep_idx, rep in enumerate(replacements):
+            #        if rep_idx >= replace_count:
+            #            break
 
-                    input_temp = inputs['input_ids'][rep][0]
-                    type_temp = inputs['token_type_ids'][rep][0]
-                    passage_str = input_temp[type_temp == 1]
-                    passage_str = tokenizer.decode(passage_str.tolist())
-                    new_encoded = tokenizer.encode_plus(question_str, text_pair=question_str, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
-                    inputs['input_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['input_ids']).to(device)
-                    inputs['token_type_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['token_type_ids']).to(device)
-                    inputs['attention_mask'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['attention_mask']).to(device)
+            #        input_temp = inputs['input_ids'][rep][0]
+            #        type_temp = inputs['token_type_ids'][rep][0]
+            #        passage_str = input_temp[type_temp == 1]
+            #        passage_str = tokenizer.decode(passage_str.tolist())
+            #        new_encoded = tokenizer.encode_plus(question_str, text_pair=question_str, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+            #        inputs['input_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['input_ids']).to(device)
+            #        inputs['token_type_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['token_type_ids']).to(device)
+            #        inputs['attention_mask'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['attention_mask']).to(device)
 
-            logger.info('calculating loss')
             loss = model(**inputs)
             epoch_iterator.set_description(f"Loss={loss.item():.3f}")
 
@@ -810,9 +839,9 @@ def train_bert(args):
 
                     # Take care of distributed/parallel training
                     model_to_save = model.module if hasattr(model, "module") else model
+                    #model_to_save.save_pretrained(output_dir)
 
-                    model_to_save.save_pretrained(output_dir)
-                    tokenizer.save_pretrained(output_dir)
+                    torch.save(model_to_save.state_dict(), os.path.join(output_dir, 'reader_model.pt'))
 
                     torch.save(args, os.path.join(output_dir, "training_args.bin"))
                     logger.info("Saving model checkpoint to %s", output_dir)
@@ -820,6 +849,8 @@ def train_bert(args):
                     torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                     torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
                     logger.info("Saving optimizer and scheduler states to %s", output_dir)
+
+            batch = tuple(t.to('cpu') for t in batch)
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -1165,15 +1196,15 @@ if __name__ == '__main__':
         help="If true, the SQuAD examples contain some that do not have an answer.",
     )
     parser.add_argument(
-        "--evaluate_during_trining",
-        action="store_true",
-        help="If true, evaulate the model during training.",
-    )
-    parser.add_argument(
         "--load_dir",
         default=None,
         type=str,
         help="The load directory where the model checkpoints are saved. Set to output_dir if not specified.",
+    )
+    parser.add_argument("--logging_steps", type=int, default=5000, help="Log every X updates steps.")
+    parser.add_argument("--save_steps", type=int, default=9999999999, help="Save checkpoint every X updates steps.")
+    parser.add_argument(
+        "--evaluate_during_training", action="store_true", help="Run evaluation during training at each logging step."
     )
 
     # Evaluation

@@ -15,7 +15,7 @@ class Reader(nn.Module):
         super(Reader, self).__init__()
         logger.info('loading model')
         # load the model used for reading
-        self.model = AutoModel.from_pretrained('outputs/spanbert-base-cased-sqdnq', config=config)
+        self.model = AutoModel.from_pretrained('outputs/spanbert-base-cased-sqdnq', config=config, )
 
         # linear layers that converts from the hidden states of the reader to starting and ending positions and rank the passages
         # can also import from spanbert, look at run_single.py
@@ -27,12 +27,10 @@ class Reader(nn.Module):
     def forward(self, input_ids, attention_mask=None, token_type_ids=None, start_positions=None, end_positions=None, is_impossible=None, rank=None):
         N, M, L = input_ids.size()
 
-        logger.info('running forward')
-
         # sequence_output = N*M x L x hidden_size
         # pooled_output = N*M x hidden_size
         # hidden_states = (N*M x L x hidden_size, N*M x L x hidden_size)
-        sequence_output, pooled_output, hidden_states = self.model(input_ids=input_ids.view(N * M, L), attention_mask=attention_mask.view(N * M, L), token_type_ids=token_type_ids.view(N * M, L))
+        sequence_output, pooled_output = self.model(input_ids=input_ids.view(N * M, L), attention_mask=attention_mask.view(N * M, L), token_type_ids=token_type_ids.view(N * M, L))
 
         # positions = N*M x L x 2
         positions = self.qa_outputs(sequence_output)
