@@ -327,10 +327,11 @@ eval-bert: dump-dir model-name nq-open-data
 		--index_dir start/1048576_flat_PQ96_8 \
 		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
 		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
+		--load_dir $(DPH_SAVE_DIR)/reader \
 		$(OPTIONS)
 
 # get the predictions from a training file, 
-# same as eval-od but TRAIN_DATA instead
+# same as eval-od but TRAIN_DATA instead for test_path
 get-predictions: dump-dir model-name nq-open-data
 	python -m densephrases.experiments.run_open \
 		--run_mode eval_inmemory \

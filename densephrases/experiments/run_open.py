@@ -415,6 +415,10 @@ def evaluate_results_kilt(predictions, qids, questions, answers, args, evidences
 
 
 def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
+    #wandb setup
+    wandb.init(project="DensePhrases-Reader-Evaluation", notes="only reranking passages", entity="howard-yen", mode="online" if args.wandb else "disabled")
+    wandb.config.update(args)
+
     # Setup CUDA, GPU & distributed evaluation
     if args.local_rank == -1 or not args.cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
@@ -429,6 +433,21 @@ def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
     config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
 
+    model = Reader(config=config)
+    model.to(device)
+    model.eval()
+
+    if args.load_dir:
+        if os.path.isfile(os.path.join(args.load_dir, "reader_model.pt")):
+            model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
+            logger.info(f'model loaded from {args.load_dir}')
+
+        else:
+            logger.info('missing reader model, exiting')
+            exit()
+    else:
+        logger.info('missing load dir, exiting')
+        exit()
 
     qids, questions, answers = load_qa_pairs(args.test_path, args)
     if query_encoder is None:
@@ -454,7 +473,7 @@ def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
                 top_k=args.top_k, max_answer_length=args.max_answer_length,
         )
         # possible prediction for each qa pair in the batch
-        # the actual phrase
+        # the actual phrase, actually a string wrapped in a list
         prediction = [[ret['answer'] for ret in out] if len(out) > 0 else [''] for out in result]
         # the passage that the phrase is found in
         evidence = [[ret['context'] for ret in out] if len(out) > 0 else [''] for out in result]
@@ -462,6 +481,47 @@ def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
         title = [[ret['title'] for ret in out] if len(out) > 0 else [''] for out in result]
         # score of the phrase
         score = [[ret['score'] for ret in out] if len(out) > 0 else [-1e10] for out in result]
+
+        question_tokens = [tokenizer.tokenize(q_text) for q_text in questions[q_idx:q_idx+step]]
+        question_tokens = [q[0:args.max_query_length] if len(q) > args.max_query_length else q for q in question_tokens]
+
+        for re_idx, out in enumerate(result):
+            torch.cuda.empty_cache()
+            if len(out) <= 0:
+                continue
+
+            input_ids = []
+            attention_masks = []
+            token_type_ids = []
+
+            for i in range(len(out)):
+                title_tokens = tokenizer.tokenize(title[re_idx][i][0])
+                evidence_tokens = tokenizer.tokenize(evidence[re_idx][i][0])
+                back_tokens = title_tokens + ['[SEP]'] + evidence_tokens
+                encoded = tokenizer.encode_plus(question_tokens[re_idx], text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+
+                input_ids.append(encoded['input_ids'])
+                attention_masks.append(encoded['attention_mask'])
+                token_type_ids.append(encoded['token_type_ids'])
+
+            input_ids = torch.tensor(input_ids).to(device)
+            attention_masks = torch.tensor(attention_masks).to(device)
+            token_type_ids = torch.tensor(token_type_ids).to(device)
+
+            # maybe calculate loss for the eval set too?
+            start_logits, end_logits, rank_logits = model(input_ids=input_ids.view(1, len(out), -1), attention_mask=attention_masks.view(1, len(out), -1), token_type_ids=token_type_ids.view(1, len(out), -1))
+
+            start_logits = start_logit.view(len(out)).tolist()
+            end_logits = end_logits.view(len(out), -1).tolist()
+            rank_logits = rank_logits.view(len(out), -1).tolist()
+
+            rerank = sorted(zip(rank_logits, start_logits, end_logits, prediction[re_idx], evidence[re_idx], title[re_idx], score[re_idx] ), key = lambda pair:pair[0], reverse=True)
+
+            prediction[re_idx] = [x for _,_,_,x,_,_,_ in rerank]
+            evidence[re_idx] = [x for _,_,_,_,x,_,_ in rerank]
+            title[re_idx] = [x for _,_,_,_,_,x,_ in rerank]
+            score[re_idx] = [x for _,_,_,_,_,_,x in rerank]
+
         predictions += prediction
         evidences += evidence
         titles += title
@@ -469,11 +529,7 @@ def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
 
     logger.info(f'Avg. {sum(mips.num_docs_list)/len(mips.num_docs_list):.2f} number of docs per entry')
 
-    logger.info(f'Reranking using BERT model')
-
-
-
-    return
+    return evaluate_results(predictions, qids, questions, answers, args, evidences, scores, titles)
 
 def process_reader_input(args, tokenizer, train_file=None):
     logger.info(f'Loading reader input dataset from {train_file if train_file is not None else args.train_file}')
