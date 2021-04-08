@@ -326,7 +326,7 @@ eval-bert: dump-dir model-name nq-open-data
 		--dump_dir $(DUMP_DIR) \
 		--index_dir start/1048576_flat_PQ96_8 \
 		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
-		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
+		--test_path $(DPH_SAVE_DIR)/dph-nqsqd-pb2_pq96-nq-10/pred/test_preprocessed_3610.pred \
 		--load_dir $(DPH_SAVE_DIR)/reader \
 		$(OPTIONS)
 

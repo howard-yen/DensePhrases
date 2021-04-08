@@ -318,9 +318,9 @@ def evaluate_results(predictions, qids, questions, answers, args, evidences, sco
     pred_path = os.path.join(
         pred_dir, os.path.splitext(os.path.basename(args.test_path))[0] + f'_{total}.pred'
     )
-    logger.info(f'Saving prediction file to {pred_path}')
-    with open(pred_path, 'w') as f:
-        json.dump(pred_out, f)
+    #logger.info(f'Saving prediction file to {pred_path}')
+    #with open(pred_path, 'w') as f:
+    #    json.dump(pred_out, f)
 
     return exact_match_top1
 
@@ -414,7 +414,7 @@ def evaluate_results_kilt(predictions, qids, questions, answers, args, evidences
     return result['downstream']['accuracy']
 
 
-def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
+def eval_results_bert(args):
     #wandb setup
     wandb.init(project="DensePhrases-Reader-Evaluation", notes="only reranking passages", entity="howard-yen", mode="online" if args.wandb else "disabled")
     wandb.config.update(args)
@@ -446,88 +446,104 @@ def eval_results_bert(args, mips=None, query_encoder=None, tokenizer=None):
             logger.info('missing reader model, exiting')
             exit()
     else:
-        logger.info('missing load dir, exiting')
+        logger.info('missing reader model load dir, exiting')
         exit()
 
-    qids, questions, answers = load_qa_pairs(args.test_path, args)
-    if query_encoder is None:
-        print(f'Query encoder will be loaded from {args.query_encoder_path}')
-        device = 'cuda' if args.cuda else 'cpu'
-        query_encoder, tokenizer = load_query_encoder(device, args)
+    with open(args.test_path, encoding='utf-8') as f:
+        data = json.load(f)
 
-    query_vec = embed_all_query(questions, args, query_encoder, tokenizer)
+    qids = []
+    predictions = []
+    evidences = []
+    titles = []
+    scores = []
+    answers = []
+    questions = []
 
-    if mips is None:
-        mips = load_phrase_index(args)
+    count = 0
 
-    step = args.eval_batch_size
-    predictions=[]
-    evidences=[]
-    titles=[]
-    scores=[]
+    def ids_to_str(input_ids, pos, length, tokenizer):
+        start_pos = pos // length
+        end_pos = pos % length
+        print('---------------')
+        print(start_pos)
+        print(end_pos)
+        s = tokenizer.decode(input_ids[start_pos:end_pos+1])
+        print(s)
+        return s
 
-    for q_idx in tqdm(range(0, len(questions), step)):
-        result = mips.search(
-                query_vec[q_idx:q_idx+step],
-                q_texts=questions[q_idx:q_idx+step], nprobe=args.nprobe,
-                top_k=args.top_k, max_answer_length=args.max_answer_length,
-        )
-        # possible prediction for each qa pair in the batch
-        # the actual phrase, actually a string wrapped in a list
-        prediction = [[ret['answer'] for ret in out] if len(out) > 0 else [''] for out in result]
-        # the passage that the phrase is found in
-        evidence = [[ret['context'] for ret in out] if len(out) > 0 else [''] for out in result]
-        # wikipedia title?
-        title = [[ret['title'] for ret in out] if len(out) > 0 else [''] for out in result]
-        # score of the phrase
-        score = [[ret['score'] for ret in out] if len(out) > 0 else [-1e10] for out in result]
+    for qid in tqdm(data):
+        if count >= 1e0:
+            break
+        else:
+            count += 1
+        qids.append(qid)
+        sample = data[qid]
 
-        question_tokens = [tokenizer.tokenize(q_text) for q_text in questions[q_idx:q_idx+step]]
-        question_tokens = [q[0:args.max_query_length] if len(q) > args.max_query_length else q for q in question_tokens]
+        question = sample['question']
+        questions.append(question)
+        answer = sample['answer']
+        prediction = sample['prediction']
+        title = sample['title']
+        evidence = sample['evidence']
+        score = sample['score']
 
-        for re_idx, out in enumerate(result):
-            torch.cuda.empty_cache()
-            if len(out) <= 0:
-                continue
+        question_tokens = tokenizer.tokenize(question)
+        if len(question_tokens) > args.max_query_length:
+            question_tokens = question_tokens[0:args.max_query_length]
 
-            input_ids = []
-            attention_masks = []
-            token_type_ids = []
+        input_ids = []
+        attention_mask = []
+        token_type_ids = []
 
-            for i in range(len(out)):
-                title_tokens = tokenizer.tokenize(title[re_idx][i][0])
-                evidence_tokens = tokenizer.tokenize(evidence[re_idx][i][0])
-                back_tokens = title_tokens + ['[SEP]'] + evidence_tokens
-                encoded = tokenizer.encode_plus(question_tokens[re_idx], text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+        M = len(prediction)
 
-                input_ids.append(encoded['input_ids'])
-                attention_masks.append(encoded['attention_mask'])
-                token_type_ids.append(encoded['token_type_ids'])
+        for idx in range(M):
+            title_tokens = tokenizer.tokenize(title[idx][0])
+            evidence_tokens = tokenizer.tokenize(evidence[idx])
+            back_tokens = title_tokens + ['SEP'] + evidence_tokens
+            encoded = tokenizer.encode_plus(question_tokens, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
 
-            input_ids = torch.tensor(input_ids).to(device)
-            attention_masks = torch.tensor(attention_masks).to(device)
-            token_type_ids = torch.tensor(token_type_ids).to(device)
+            input_ids.append(encoded['input_ids'])
+            attention_mask.append(encoded['attention_mask'])
+            token_type_ids.append(encoded['token_type_ids'])
 
-            # maybe calculate loss for the eval set too?
-            start_logits, end_logits, rank_logits = model(input_ids=input_ids.view(1, len(out), -1), attention_mask=attention_masks.view(1, len(out), -1), token_type_ids=token_type_ids.view(1, len(out), -1))
+        input_ids = torch.tensor(input_ids).to(device)
+        attention_mask = torch.tensor(attention_mask).to(device)
+        token_type_ids = torch.tensor(token_type_ids).to(device)
 
-            start_logits = start_logit.view(len(out)).tolist()
-            end_logits = end_logits.view(len(out), -1).tolist()
-            rank_logits = rank_logits.view(len(out), -1).tolist()
+        #can also calculate loss for the eval set
+        start_logits, end_logits, rank_logits = model(input_ids=input_ids.view(1, M, -1), attention_mask=attention_mask.view(1, M, -1), token_type_ids=token_type_ids.view(1, M, -1))
 
-            rerank = sorted(zip(rank_logits, start_logits, end_logits, prediction[re_idx], evidence[re_idx], title[re_idx], score[re_idx] ), key = lambda pair:pair[0], reverse=True)
+        input_ids = input_ids.to('cpu')
+        attention_mask = attention_mask.to('cpu')
+        token_type_ids = token_type_ids.to('cpu')
 
-            prediction[re_idx] = [x for _,_,_,x,_,_,_ in rerank]
-            evidence[re_idx] = [x for _,_,_,_,x,_,_ in rerank]
-            title[re_idx] = [x for _,_,_,_,_,x,_ in rerank]
-            score[re_idx] = [x for _,_,_,_,_,_,x in rerank]
+        rank_logits = rank_logits.view(M)
+        start_logits = start_logits.view(M, -1)
+        end_logits = end_logits.view(M, -1)
 
-        predictions += prediction
-        evidences += evidence
-        titles += title
-        scores += score
+        # M x max_seq_length x max_seq_length
+        span_logits = torch.bmm(start_logits.view(M, -1, 1), end_logits.view(M, 1, -1))
+        span_logits = torch.triu(span_logits)
+        span_logits[span_logits==0] = 1e10
 
-    logger.info(f'Avg. {sum(mips.num_docs_list)/len(mips.num_docs_list):.2f} number of docs per entry')
+        best_span = torch.argmin(span_logits.view(M, -1), dim=1)
+
+        prediction = [ids_to_str(input_ids[i], pos, args.max_seq_length, tokenizer) for i, pos in enumerate(best_span)]
+
+        _, indices = torch.sort(rank_logits, descending=True)
+
+        prediction = [prediction[i] for i in indices]
+        evidence = [evidence[i] for i in indices]
+        title = [title[i] for i in indices]
+        score = [score[i] for i in indices]
+
+        predictions.append(prediction)
+        evidences.append(evidence)
+        titles.append(title)
+        scores.append(score)
+        answers.append(answer)
 
     return evaluate_results(predictions, qids, questions, answers, args, evidences, scores, titles)
 
