@@ -465,11 +465,11 @@ def eval_results_bert(args):
     def ids_to_str(input_ids, pos, length, tokenizer):
         start_pos = pos // length
         end_pos = pos % length
-        print('---------------')
-        print(start_pos)
-        print(end_pos)
+        #print('---------------')
+        #print(start_pos)
+        #print(end_pos)
         s = tokenizer.decode(input_ids[start_pos:end_pos+1])
-        print(s)
+        #print(s)
         return s
 
     for qid in tqdm(data):
@@ -603,9 +603,10 @@ def process_reader_input(args, tokenizer, train_file=None):
                 back_tokens = before_answer + answer_tokens + after_answer
 
                 # before passage + before answer + answer token length must be smaller than args.max_seq_length or the reader won't be able to even see it
-                if before_passage_length + len(before_answer) + len(answer_tokens) <= args.max_seq_length:
-                    starts.append(before_passage_length + len(before_answer) + 1)
-                    ends.append(before_passage_length + len(before_answer) + len(answer_tokens))
+                if before_passage_length + len(before_answer) < args.max_seq_length:
+                    starts.append(before_passage_length + len(before_answer))
+                    _end_pos = before_passage_length + len(before_answer) + len(answer_tokens) - 1
+                    ends.append(_end_pos if _end_pos < args.max_seq_length else args.max_seq_length-1)
                     if best == -1:
                         best = pred_idx
                 else:

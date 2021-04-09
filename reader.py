@@ -48,10 +48,13 @@ class Reader(nn.Module):
         end_logits = softmax(end_pos)
         rank_logits = softmax(ranks.view(N, M))
 
+        #start_loss, end_loss, rank_loss = self.compute_loss(start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, rank, N, M, L)
         if self.training:
             return self.compute_loss(start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, rank, N, M, L)
+            #return start_loss + end_loss + rank_loss
 
         return start_logits.view(N, M, L), end_logits.view(N, M, L), rank_logits.view(N, M)
+        #return start_loss.view(N, M, L), end_loss.view(N, M, L), rank_loss.view(N, M)
 
     def compute_loss(self, start_logits, end_logits, rank_logits, start_positions, end_positions, is_impossible, rank, N, M, L):
         ignore_index = -1
@@ -72,12 +75,23 @@ class Reader(nn.Module):
         rank_loss = nll(rank_logits, rank)
 
         return start_loss + end_loss + rank_loss
+        #return start_loss, end_loss, rank_loss
+
+def ids_to_str(input_ids, pos, length, tokenizer):
+    start_pos = pos // length
+    end_pos = pos % length
+    #print('---------------')
+    #print(start_pos)
+    #print(end_pos)
+    s = tokenizer.decode(input_ids[start_pos:end_pos+1])
+    print(s)
+    return s
 
 # for testing, delete later
 def process_reader_input(tokenizer, train_file=None):
     logger.info(f'Loading reader input dataset from {train_file}')
     with open(train_file, encoding='utf-8') as f:
-        data = json.load(f)['data'][0:100]
+        data = json.load(f)['data'][1:3]
 
     all_input_ids = []
     all_token_type_ids = []
@@ -108,8 +122,8 @@ def process_reader_input(tokenizer, train_file=None):
         best = -1
 
         question_tokens = tokenizer.tokenize(question)
-        if len(question_tokens) > 64:
-            question_tokens = question_tokens[0:64]
+        if len(question_tokens) > 384:
+            question_tokens = question_tokens[0:384]
 
         for pred_idx, pred in enumerate(predictions):
             title_tokens = tokenizer.tokenize(titles[pred_idx])
@@ -131,8 +145,9 @@ def process_reader_input(tokenizer, train_file=None):
 
                 # before passage + before answer + answer token length must be smaller than args.max_seq_length or the reader won't be able to even see it
                 if before_passage_length + len(before_answer) + len(answer_tokens) <= 384:
-                    starts.append(before_passage_length + len(before_answer) + 1)
-                    ends.append(before_passage_length + len(before_answer) + len(answer_tokens))
+                    starts.append(before_passage_length + len(before_answer))
+                    ends.append(before_passage_length + len(before_answer) + len(answer_tokens) - 1)
+
                     if best == -1:
                         best = pred_idx
                 else:
@@ -144,18 +159,21 @@ def process_reader_input(tokenizer, train_file=None):
 
             encoded = tokenizer.encode_plus(front_tokens, text_pair=back_tokens, max_length=384, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
 
+            if starts[-1] > 0:
+                temp = encoded['input_ids'][starts[-1]:ends[-1] + 1]
+
             input_ids.append(encoded['input_ids'])
             token_type_ids.append(encoded['token_type_ids'])
             attention_mask.append(encoded['attention_mask'])
 
         # need to pad so ensure the same size in every dimension
-        # use negative samples from other passages
+        # replaced by negative sample in batch while training
         for extra in range(len(predictions), 10):
             input_ids.append([0 for i in range(384)])
             token_type_ids.append([0 for i in range(384)])
             attention_mask.append([0 for i in range(384)])
-            starts.append(-1)
-            ends.append(-1)
+            starts.append(0)
+            ends.append(0)
             is_impossible.append(-1)
 
         all_input_ids.append(input_ids)
@@ -187,11 +205,10 @@ if __name__ == '__main__':
     device = 'cuda'
     model = Reader(config=config)
     model.to(device)
-    args = {'train_file': 'tqa_ds_train.json'}
 
     logger.info('loading dataset')
     dataset = process_reader_input(tokenizer, train_file='tqa_ds_train.json')
-    dataloader = DataLoader(dataset, batch_size=2)
+    dataloader = DataLoader(dataset, batch_size=1)
 
     model.train()
 
@@ -211,4 +228,4 @@ if __name__ == '__main__':
         }
         #loss = model(**inputs)
         #print(loss)
-        sequence_output, pooled_output, hidden_states = model.model(input_ids=inputs['input_ids'].view(-1, 384), attention_mask=inputs['attention_mask'].view(-1, 384), token_type_ids=inputs['token_type_ids'].view(-1, 384))
+        #sequence_output, pooled_output, hidden_states = model.model(input_ids=inputs['input_ids'].view(-1, 384), attention_mask=inputs['attention_mask'].view(-1, 384), token_type_ids=inputs['token_type_ids'].view(-1, 384))
