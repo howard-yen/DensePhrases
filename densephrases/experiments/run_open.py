@@ -26,7 +26,6 @@ from densephrases.utils.eval_utils import normalize_answer, f1_score, exact_matc
 from densephrases.utils.kilt.eval import evaluate as kilt_evaluate
 from densephrases.utils.kilt.kilt_utils import store_data as kilt_store_data
 from densephrases.experiments.run_single import load_and_cache_examples
-from reader import Reader
 
 from transformers import (
     MODEL_MAPPING,
@@ -37,6 +36,10 @@ from transformers import (
     AdamW,
     get_linear_schedule_with_warmup,
 )
+
+from reader import Reader
+from reranker import Reranker
+from utils import process_sample
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
@@ -217,8 +220,8 @@ def eval_inmemory(args, mips=None, query_encoder=None, tokenizer=None):
     return eval_fn(predictions, qids, questions, answers, args, evidences, scores, titles)
 
 
-def evaluate_results(predictions, qids, questions, answers, args, evidences, scores, titles, q_tokens=None):
-    wandb.init(project="DensePhrases (open)", mode="online" if args.wandb else "disabled")
+def evaluate_results(predictions, qids, questions, answers, args, evidences, scores, titles, q_tokens=None, save_predictions=True):
+    wandb.init(project="DensePhrases", entity="howard-yen", mode="online" if args.wandb else "disabled")
     wandb.config.update(args)
 
     # Filter if there's candidate
@@ -318,16 +321,18 @@ def evaluate_results(predictions, qids, questions, answers, args, evidences, sco
     pred_path = os.path.join(
         pred_dir, os.path.splitext(os.path.basename(args.test_path))[0] + f'_{total}.pred'
     )
-    #logger.info(f'Saving prediction file to {pred_path}')
-    #with open(pred_path, 'w') as f:
-    #    json.dump(pred_out, f)
+
+    if save_predictions:
+        logger.info(f'Saving prediction file to {pred_path}')
+        with open(pred_path, 'w') as f:
+            json.dump(pred_out, f)
 
     return exact_match_top1
 
 
 def evaluate_results_kilt(predictions, qids, questions, answers, args, evidences, scores, titles):
-    wandb.init(project="DensePhrases (KILT)", mode="online" if args.wandb else "disabled")
-    wandb.config.update(args)
+    #wandb.init(project="DensePhrases (KILT)", mode="online" if args.wandb else "disabled")
+    #wandb.config.update(args)
     total=len(predictions)
 
     # load title2id dict and convert predicted titles into wikipedia_ids
@@ -380,7 +385,7 @@ def evaluate_results_kilt(predictions, qids, questions, answers, args, evidences
     }
 
     logger.info(result_to_logging)
-    wandb.log(result_to_logging)
+    #wandb.log(result_to_logging)
 
     # make custom predictions
     pred_out = {}
@@ -413,10 +418,9 @@ def evaluate_results_kilt(predictions, qids, questions, answers, args, evidences
 
     return result['downstream']['accuracy']
 
-
-def eval_results_bert(args):
+def eval_reranker(args, model=None, tokenizer=None, config=None, prefix=None):
     #wandb setup
-    wandb.init(project="DensePhrases-Reader-Evaluation", notes="only reranking passages", entity="howard-yen", mode="online" if args.wandb else "disabled")
+    wandb.init(project="DensePhrases-Reranker-Evaluation", notes="", entity="howard-yen", mode="online" if args.wandb else "disabled")
     wandb.config.update(args)
 
     # Setup CUDA, GPU & distributed evaluation
@@ -430,24 +434,27 @@ def eval_results_bert(args):
         args.n_gpu = 1
     args.device = device
 
-    config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+    config = config if config is not None else AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+    tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
 
-    model = Reader(config=config)
+    if model is not None:
+        model = model
+    else:
+        model = Reranker(config=config)
+        if args.load_dir:
+            if os.path.isfile(os.path.join(args.load_dir, "pytorch_model.bin")):
+                model.load_state_dict(torch.load(os.path.join(args.load_dir, "pytorch_model.bin")))
+                logger.info(f'model loaded from {args.load_dir}')
+
+            else:
+                logger.info('missing reranker model, exiting')
+                exit()
+        else:
+            logger.info('missing reranker model load dir, exiting')
+            exit()
+
     model.to(device)
     model.eval()
-
-    if args.load_dir:
-        if os.path.isfile(os.path.join(args.load_dir, "reader_model.pt")):
-            model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
-            logger.info(f'model loaded from {args.load_dir}')
-
-        else:
-            logger.info('missing reader model, exiting')
-            exit()
-    else:
-        logger.info('missing reader model load dir, exiting')
-        exit()
 
     with open(args.test_path, encoding='utf-8') as f:
         data = json.load(f)
@@ -462,18 +469,8 @@ def eval_results_bert(args):
 
     count = 0
 
-    def ids_to_str(input_ids, pos, length, tokenizer):
-        start_pos = pos // length
-        end_pos = pos % length
-        #print('---------------')
-        #print(start_pos)
-        #print(end_pos)
-        s = tokenizer.decode(input_ids[start_pos:end_pos+1])
-        #print(s)
-        return s
-
     for qid in tqdm(data):
-        if count >= 1e0:
+        if count >= 1e1111:
             break
         else:
             count += 1
@@ -500,9 +497,11 @@ def eval_results_bert(args):
 
         for idx in range(M):
             title_tokens = tokenizer.tokenize(title[idx][0])
+            pred_tokens = tokenizer.tokenize(prediction[idx])
             evidence_tokens = tokenizer.tokenize(evidence[idx])
-            back_tokens = title_tokens + ['SEP'] + evidence_tokens
-            encoded = tokenizer.encode_plus(question_tokens, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+            back_tokens = pred_tokens + ['[SEP]'] + title_tokens + ['[SEP]'] + evidence_tokens
+            #encoded = tokenizer.encode_plus(question_tokens, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+            encoded = tokenizer.encode_plus(question_tokens, text_pair=back_tokens, max_length=args.max_seq_length, padding='max_length', truncation=True, return_token_type_ids=True, return_attention_mask=True, is_split_into_words=True)
 
             input_ids.append(encoded['input_ids'])
             attention_mask.append(encoded['attention_mask'])
@@ -513,24 +512,9 @@ def eval_results_bert(args):
         token_type_ids = torch.tensor(token_type_ids).to(device)
 
         #can also calculate loss for the eval set
-        start_logits, end_logits, rank_logits = model(input_ids=input_ids.view(1, M, -1), attention_mask=attention_mask.view(1, M, -1), token_type_ids=token_type_ids.view(1, M, -1))
-
-        input_ids = input_ids.to('cpu')
-        attention_mask = attention_mask.to('cpu')
-        token_type_ids = token_type_ids.to('cpu')
+        rank_logits = model(input_ids=input_ids.view(-1, M, args.max_seq_length), attention_mask=attention_mask.view(-1, M, args.max_seq_length), token_type_ids=token_type_ids.view(-1, M, args.max_seq_length))
 
         rank_logits = rank_logits.view(M)
-        start_logits = start_logits.view(M, -1)
-        end_logits = end_logits.view(M, -1)
-
-        # M x max_seq_length x max_seq_length
-        span_logits = torch.bmm(start_logits.view(M, -1, 1), end_logits.view(M, 1, -1))
-        span_logits = torch.triu(span_logits)
-        span_logits[span_logits==0] = 1e10
-
-        best_span = torch.argmin(span_logits.view(M, -1), dim=1)
-
-        prediction = [ids_to_str(input_ids[i], pos, args.max_seq_length, tokenizer) for i, pos in enumerate(best_span)]
 
         _, indices = torch.sort(rank_logits, descending=True)
 
@@ -539,13 +523,217 @@ def eval_results_bert(args):
         title = [title[i] for i in indices]
         score = [score[i] for i in indices]
 
+        input_ids = input_ids.to('cpu')
+        attention_mask = attention_mask.to('cpu')
+        token_type_ids = token_type_ids.to('cpu')
+
         predictions.append(prediction)
         evidences.append(evidence)
         titles.append(title)
         scores.append(score)
         answers.append(answer)
 
-    return evaluate_results(predictions, qids, questions, answers, args, evidences, scores, titles)
+    return evaluate_results(predictions, qids, questions, answers, args, evidences, scores, titles, save_predictions=False)
+
+
+def eval_reader(args, model=None, tokenizer=None, config=None):
+    #wandb setup
+    wandb.init(project="DensePhrases-Reader-Evaluation", notes="", entity="howard-yen", mode="online" if args.wandb else "disabled")
+    wandb.config.update(args)
+
+    # Setup CUDA, GPU & distributed evaluation
+    if args.local_rank == -1 or not args.cuda:
+        device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+        args.n_gpu = 0 if not args.cuda else torch.cuda.device_count()
+    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend="nccl")
+        args.n_gpu = 1
+    args.device = device
+
+    config = config if config is not None else AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+    tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+
+    model = AutoModelForQuestionAnswering.from_pretrained("ankur310794/roberta-base-squad2-nq", cache_dir="./cache")
+
+    #if model is not None:
+    #    model = model
+    #else:
+    #    model = Reader(config=config)
+    #    if args.load_dir:
+    #        if os.path.isfile(os.path.join(args.load_dir, "reader_model.pt")):
+    #            model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
+    #            logger.info(f'model loaded from {args.load_dir}')
+
+    #        else:
+    #            logger.info('missing reader model, exiting')
+    #            exit()
+    #    else:
+    #        logger.info('missing reader model load dir, exiting')
+    #        exit()
+
+    model.to(device)
+    model.eval()
+
+
+    with open(args.test_path, encoding='utf-8') as f:
+        data = json.load(f)
+
+    qids = []
+    predictions = []
+    evidences = []
+    titles = []
+    scores = []
+    answers = []
+    questions = []
+    new_predictions = []
+
+    count = 0
+
+    softmax = torch.nn.Softmax(dim=-1)
+
+    with torch.no_grad():
+        for qid in tqdm(data):
+            if count >= 1e100000:
+                break
+            else:
+                count += 1
+            qids.append(qid)
+            sample = data[qid]
+
+            question = sample['question']
+            questions.append(question)
+            answer = sample['answer']
+            prediction = sample['prediction']
+            title = sample['title']
+            evidence = sample['evidence']
+            score = sample['score']
+
+            processed = process_sample(tokenizer, question, answer, prediction, title, evidence, max_seq_length=args.max_seq_length)
+            M = len(prediction)
+
+            input_ids = torch.tensor(processed['input_ids']).to(device)
+            attention_mask = torch.tensor(processed['attention_mask']).to(device)
+            token_type_ids = torch.tensor(processed['token_type_ids']).to(device)
+
+            #can also calculate loss for the eval set
+            output = model(input_ids=input_ids.view(-1, args.max_seq_length), attention_mask=attention_mask.view(-1, args.max_seq_length), token_type_ids=token_type_ids.view(-1, args.max_seq_length))
+
+            start_logits = output.start_logits
+            end_logits = output.end_logits
+
+            start_prob = softmax(start_logits)
+            end_prob = softmax(end_logits)
+
+            span_prob = torch.bmm(start_prob.view(M, -1, 1), end_prob.view(M, 1, -1))
+            span_prob = torch.triu(span_prob)
+
+            # mask to limit the length of the span
+            mask = torch.ones_like(span_prob)
+            mask = torch.triu(mask, diagonal=args.max_answer_length)
+            span_prob[mask==1] = 0
+            # mask out the question
+            span_prob[token_type_ids==0] = 0
+
+            best_span = torch.argmax(span_prob.view(M, -1), dim=1)
+
+            offset = processed['offset_mapping']
+            new_prediction = [processed['backs'][idx][offset[idx][pos//args.max_seq_length][0]:offset[idx][pos%args.max_seq_length][1]] for idx, pos in enumerate(best_span)]
+
+            input_ids = input_ids.to('cpu')
+            attention_mask = attention_mask.to('cpu')
+            token_type_ids = token_type_ids.to('cpu')
+
+            new_predictions.append(new_prediction)
+            predictions.append(prediction)
+            evidences.append(evidence)
+            titles.append(title)
+            scores.append(score)
+            answers.append(answer)
+
+    return evaluate_results(new_predictions, qids, questions, answers, args, evidences, scores, titles, save_predictions=False)
+
+def process_reranker_input(args, tokenizer, train_file=None):
+    logger.info(f'Loading reader input dataset from {train_file if train_file is not None else args.train_file}')
+    with open(train_file if train_file is not None else args.train_file, encoding='utf-8') as f:
+        data = json.load(f)['data']
+
+    all_input_ids = []
+    all_token_type_ids = []
+    all_attention_mask = []
+    all_is_impossible = []
+    #all_best_passage = []
+    all_ems = []
+
+    for sample_idx, sample in enumerate(tqdm(data)):
+
+        question = sample['question']
+        answer = sample['answer']
+        predictions = sample['prediction']
+        titles = sample['title']
+        evidences = sample['evidence']
+        scores = sample['score']
+        f1s = sample['f1s']
+        ems = sample['exact_matches']
+        ems = [1 if em else 0 for em in ems]
+
+        if max(ems) < 1:
+            continue
+
+        is_impossible = sample['is_impossible']
+        is_impossible = [1 if imp else 0 for imp in is_impossible]
+
+
+        input_ids = []
+        token_type_ids = []
+        attention_mask = []
+        best = 0
+
+        question_tokens = tokenizer.tokenize(question)
+        if len(question_tokens) > args.max_query_length:
+            question_tokens = question_tokens[0:args.max_query_length]
+
+        for pred_idx, pred in enumerate(predictions):
+            title_tokens = tokenizer.tokenize(titles[pred_idx])
+            pred_tokens = tokenizer.tokenize(pred)
+            passage_tokens = tokenizer.tokenize(evidences[pred_idx])
+            back_tokens = pred_tokens + ['[SEP]'] + title_tokens + ['[SEP]'] + passage_tokens
+
+            #encoded = tokenizer.encode_plus(question, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+            encoded = tokenizer.encode_plus(question_tokens, text_pair=back_tokens, max_length=args.max_seq_length, padding='max_length', truncation=True, return_token_type_ids=True, return_attention_mask=True, is_split_into_words=True)
+
+            input_ids.append(encoded['input_ids'])
+            token_type_ids.append(encoded['token_type_ids'])
+            attention_mask.append(encoded['attention_mask'])
+
+        # need to pad so ensure the same size in every dimension
+        # replaced by negative sample in batch while training
+        for extra in range(len(predictions), args.top_k):
+            input_ids.append([0 for i in range(args.max_seq_length)])
+            token_type_ids.append([0 for i in range(args.max_seq_length)])
+            attention_mask.append([0 for i in range(args.max_seq_length)])
+            is_impossible.append(-1)
+            ems.append(-1)
+
+        all_input_ids.append(input_ids)
+        all_token_type_ids.append(token_type_ids)
+        all_attention_mask.append(attention_mask)
+        all_is_impossible.append(is_impossible)
+        #all_best_passage.append(best)
+        all_ems.append(ems)
+
+    all_input_ids = torch.tensor(all_input_ids)
+    all_token_type_ids = torch.tensor(all_token_type_ids)
+    all_attention_mask = torch.tensor(all_attention_mask)
+    all_is_impossible = torch.tensor(all_is_impossible)
+    all_ems = torch.tensor(all_ems)
+    #all_best_passage = torch.tensor(all_best_passage)
+
+    dataset = TensorDataset(all_input_ids, all_token_type_ids, all_attention_mask, all_is_impossible, all_ems)
+
+    return dataset
+
 
 def process_reader_input(args, tokenizer, train_file=None):
     logger.info(f'Loading reader input dataset from {train_file if train_file is not None else args.train_file}')
@@ -652,8 +840,293 @@ def process_reader_input(args, tokenizer, train_file=None):
 
     return dataset
 
+def train_reranker(args):
+    #wandb setup
+    wandb.init(project="DensePhrases-Reranker-Training", entity='howard-yen', mode="online" if args.wandb else "disabled")
+    wandb.config.update(args)
 
-def train_bert(args):
+    # Setup CUDA, GPU & distributed training
+    if args.local_rank == -1 or not args.cuda:
+        device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+        args.n_gpu = 0 if not args.cuda else torch.cuda.device_count()
+    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend="nccl")
+        args.n_gpu = 1
+    args.device = device
+
+    torch.cuda.empty_cache()
+
+    logger.info('Training reader model used for reranking')
+    config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
+
+    model = Reranker(config=config)
+    model.to(device)
+
+    # Check if saved model states exist
+    if args.load_dir:
+        if os.path.isfile(os.path.join(args.load_dir, "reranker_model_load")):
+            # Load in saved model states
+            model = model.from_pretrained(os.path.join(args.load_dir, "reranker_model_load"))
+            #model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
+            logger.info(f'model loaded from {args.load_dir}')
+
+    train_dataset = process_reranker_input(args, tokenizer)
+
+    args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+
+
+    # Optimizer setting
+    def is_train_param(name):
+        return True
+        if name.endswith("bert_start.embeddings.word_embeddings.weight") or \
+            name.endswith("bert_end.embeddings.word_embeddings.weight") or \
+            name.endswith("bert_q_start.embeddings.word_embeddings.weight") or \
+            name.endswith("bert_q_end.embeddings.word_embeddings.weight"):
+            logger.info(f'freezing {name}')
+            return False
+        return True
+
+    if args.max_steps > 0:
+        t_total = args.max_steps
+        args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+    else:
+        t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [{
+            "params": [
+                p for n, p in model.named_parameters() \
+                    if not any(nd in n for nd in no_decay) and is_train_param(n)
+            ],
+            "weight_decay": args.weight_decay,
+        }, {
+            "params": [
+                p for n, p in model.named_parameters() \
+                    if any(nd in n for nd in no_decay) and is_train_param(n)
+            ],
+            "weight_decay": 0.0
+        },
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
+    )
+
+    # Check if saved optimizer or scheduler states exist
+    if args.load_dir:
+        if os.path.isfile(os.path.join(args.load_dir, "optimizer.pt")) and os.path.isfile(
+            os.path.join(args.load_dir, "scheduler.pt")
+        ):
+            # Load in optimizer and scheduler states
+            optimizer.load_state_dict(torch.load(os.path.join(args.load_dir, "optimizer.pt")))
+            scheduler.load_state_dict(torch.load(os.path.join(args.load_dir, "scheduler.pt")))
+            logger.info(f'optimizer and scheduler loaded from {args.load_dir}')
+
+    if args.fp16:
+        try:
+            from apex import amp
+        except ImportError:
+            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+
+    # multi-gpu training (should be after apex fp16 initialization)
+    if args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+    # Distributed training (should be after apex fp16 initialization)
+    if args.local_rank != -1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
+        )
+
+    # Train!
+    logger.info("***** Running training *****")
+    logger.info("  Num examples = %d", len(train_dataset))
+    logger.info("  Num Epochs = %d", args.num_train_epochs)
+    logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
+    logger.info(
+        "  Total train batch size (w. parallel, distributed & accumulation) = %d",
+        args.train_batch_size
+        * args.gradient_accumulation_steps
+        * (torch.distributed.get_world_size() if args.local_rank != -1 else 1),
+    )
+    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+    logger.info("  Total optimization steps = %d", t_total)
+
+    global_step = 1
+    epochs_trained = 0
+    steps_trained_in_current_epoch = 0
+    # Check if continuing training from a checkpoint
+    if args.load_dir:
+        try:
+            # set global_step to global_step of last saved checkpoint from model path
+            checkpoint_suffix = args.load_dir.split("-")[-1].split("/")[0]
+            global_step = int(checkpoint_suffix)
+            epochs_trained = global_step // (len(train_dataloader) // args.gradient_accumulation_steps)
+            steps_trained_in_current_epoch = global_step % (len(train_dataloader) // args.gradient_accumulation_steps)
+
+            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
+            logger.info("  Continuing training from epoch %d", epochs_trained)
+            logger.info("  Continuing training from global step %d", global_step)
+            logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
+        except ValueError:
+            logger.info("  Starting fine-tuning.")
+
+    tr_loss, logging_loss = 0.0, 0.0
+    model.zero_grad()
+    train_iterator = trange(
+        epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
+    )
+    # Added here for reproductibility
+    set_seed(args)
+
+    for ep_idx, _ in enumerate(train_iterator):
+        logger.info(f"\n[Epoch {ep_idx+1}]")
+
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+        for step, batch in enumerate(epoch_iterator):
+            # Skip past any already trained steps if resuming training
+            if steps_trained_in_current_epoch > 0:
+                steps_trained_in_current_epoch -= 1
+                continue
+
+            model.train()
+
+            torch.cuda.empty_cache()
+
+            batch = tuple(t.to(device) for t in batch)
+
+            inputs = {
+                "input_ids": batch[0],
+                "token_type_ids": batch[1],
+                "attention_mask": batch[2],
+                #"start_positions": batch[3],
+                #"end_positions": batch[4],
+                "is_impossible": batch[3],
+                #"rank": batch[6],
+                "ems": batch[4],
+            }
+
+            # skip this batch if none of phrases have an exact match
+            if inputs['ems'].max() < 1:
+                continue
+
+            N = inputs['is_impossible'].size(0)
+            # in batch negatives
+            #for im_idx, im in enumerate(inputs['is_impossible']):
+            #    logger.info('doing in-batch negatives')
+            #    # can fill with negative example if didn't have passage
+            #    # can change to only have one positive passage during training
+            #    replace_count = torch.numel(im[im==-1])
+            #    if replace_count == 0:
+            #        continue
+            #    # for now, assume batch_size >= top_k
+            #    replacements = torch.randperm(N-1)
+            #    replacements[replacements >= im_idx] += 1
+
+            #    input_temp = inputs['input_ids'][im_idx][0]
+            #    type_temp = inputs['token_type_ids'][im_idx][0]
+            #    question_str = input_temp[type_temp == 0]
+            #    question_str = tokenizer.decode(question_str.tolist())
+
+            #    for rep_idx, rep in enumerate(replacements):
+            #        if rep_idx >= replace_count:
+            #            break
+
+            #        input_temp = inputs['input_ids'][rep][0]
+            #        type_temp = inputs['token_type_ids'][rep][0]
+            #        passage_str = input_temp[type_temp == 1]
+            #        passage_str = tokenizer.decode(passage_str.tolist())
+            #        new_encoded = tokenizer.encode_plus(question_str, text_pair=question_str, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
+            #        inputs['input_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['input_ids']).to(device)
+            #        inputs['token_type_ids'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['token_type_ids']).to(device)
+            #        inputs['attention_mask'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['attention_mask']).to(device)
+
+            loss = model(**inputs)
+            epoch_iterator.set_description(f"Loss={loss.item():.3f}")
+
+            if args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+
+            if args.fp16:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
+            tr_loss += loss.item()
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                if args.fp16:
+                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                optimizer.step()
+                scheduler.step()  # Update learning rate schedule
+                model.zero_grad()
+                global_step += 1
+
+                # Log metrics
+                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    # Only evaluate when single GPU otherwise metrics may not average well
+                    if args.local_rank == -1 and args.evaluate_during_training:
+                        # Validation acc
+                        logger.setLevel(logging.WARNING)
+                        results, _ = eval_reranker(args, model, tokenizer, config, prefix=global_step)
+                        wandb.log(
+                            {"Eval EM": results['exact'], "Eval F1": results['f1']}, step=global_step,
+                        )
+                        logger.setLevel(logging.INFO)
+
+                    wandb.log(
+                        {"lr": scheduler.get_lr()[0], "loss": (tr_loss - logging_loss) / args.logging_steps},
+                        step=global_step
+                    )
+                    logging_loss = tr_loss
+
+                # Save model checkpoint
+                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                    output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
+                    if not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+
+                    # Take care of distributed/parallel training
+                    model_to_save = model.module if hasattr(model, "module") else model
+                    model_to_save.save_pretrained(output_dir)
+                    tokenizer.save_pretrained(output_dir)
+
+                    #torch.save(model_to_save.state_dict(), os.path.join(output_dir, 'reader_model.pt'))
+                    #model.save_pretrained(os.path.join(output_dir, 'reranker_model'))
+
+                    torch.save(args, os.path.join(output_dir, "training_args.bin"))
+                    logger.info("Saving model checkpoint to %s", output_dir)
+
+                    torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+                    torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                    logger.info("Saving optimizer and scheduler states to %s", output_dir)
+
+            batch = tuple(t.to('cpu') for t in batch)
+
+            if args.max_steps > 0 and global_step > args.max_steps:
+                epoch_iterator.close()
+                break
+
+        if args.max_steps > 0 and global_step > args.max_steps:
+            train_iterator.close()
+            break
+
+    return global_step, tr_loss / global_step
+
+
+
+def train_reader(args):
     #wandb setup
     wandb.init(project="DensePhrases-Reader-Training", entity='howard-yen', mode="online" if args.wandb else "disabled")
     wandb.config.update(args)
@@ -671,7 +1144,7 @@ def train_bert(args):
 
     torch.cuda.empty_cache()
 
-    logger.info('Training BERT model used for reranking')
+    logger.info('Training BERT model used for reading')
     config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
 
@@ -680,9 +1153,10 @@ def train_bert(args):
 
     # Check if saved model states exist
     if args.load_dir:
-        if os.path.isfile(os.path.join(args.load_dir, "reader_model.pt")):
-            # Load in optimizer and scheduler states
-            model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
+        if os.path.isfile(os.path.join(args.load_dir, "reader_model_load")):
+            # Load in saved model states
+            model = model.from_pretrained(os.path.join(args.load_dir, "reader_model_load"))
+            #model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
             logger.info(f'model loaded from {args.load_dir}')
 
     train_dataset = process_reader_input(args, tokenizer)
@@ -892,7 +1366,7 @@ def train_bert(args):
                     if args.local_rank == -1 and args.evaluate_during_training:
                         # Validation acc
                         logger.setLevel(logging.WARNING)
-                        results, _ = evaluate(args, model, tokenizer, prefix=global_step)
+                        results, _ = eval_result_bert(args, model, tokenizer, config) #, prefix=global_step)
                         wandb.log(
                             {"Eval EM": results['exact'], "Eval F1": results['f1']}, step=global_step,
                         )
@@ -914,7 +1388,8 @@ def train_bert(args):
                     model_to_save = model.module if hasattr(model, "module") else model
                     #model_to_save.save_pretrained(output_dir)
 
-                    torch.save(model_to_save.state_dict(), os.path.join(output_dir, 'reader_model.pt'))
+                    #torch.save(model_to_save.state_dict(), os.path.join(output_dir, 'reader_model.pt'))
+                    reader.save_pretrained(os.path.join(output_dir, 'reader_model'))
 
                     torch.save(args, os.path.join(output_dir, "training_args.bin"))
                     logger.info("Saving model checkpoint to %s", output_dir)
@@ -1317,11 +1792,17 @@ if __name__ == '__main__':
     elif args.run_mode == 'eval_inmemory':
         eval_inmemory(args)
 
-    elif args.run_mode == 'eval_results_bert':
-        eval_results_bert(args)
+    elif args.run_mode == 'eval_reader':
+        eval_reader(args)
 
-    elif args.run_mode == 'train_bert':
-        features, dataset = train_bert(args)
+    elif args.run_mode == 'eval_reranker':
+        eval_reranker(args)
+
+    elif args.run_mode == 'train_reader':
+        steps, loss = train_reader(args)
+
+    elif args.run_mode == 'train_reranker':
+        steps, loss = train_reranker(args)
 
     else:
         raise NotImplementedError
