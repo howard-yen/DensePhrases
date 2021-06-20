@@ -22,7 +22,7 @@ except ModuleNotFoundError:
         drqa_regex_match_score,
         drqa_metric_max_over_ground_truths
     )
-    
+
 # fix random seed
 random.seed(0)
 
@@ -40,21 +40,21 @@ def main(args):
 
     for sample_id in tqdm(data):
         sample = data[sample_id]
-        
+
         question = sample['question']
         answers = sample['answer']
         predictions = sample['prediction']
         titles = sample['title']
         evidences = sample['evidence']
-    
+
         match_fn = drqa_regex_match_score if args.regex else drqa_exact_match_score
-        
+
         answer_text = ""
         answer_start = -1
         ds_context = ""
         ds_title = ""
         # is_from_context = False
-        
+
         # check if prediction is matched in a golden answer in the answer list
         for pred_idx, pred in enumerate(predictions):
             if pred != "" and drqa_metric_max_over_ground_truths(match_fn, pred, answers):
@@ -63,7 +63,7 @@ def main(args):
                 ds_title = titles[pred_idx][0]
                 answer_start = find_substring_and_return_random_idx(answer_text, ds_context)
                 break
-        
+
         # NOTE! hide these lines because is_from_context contains too many noises
         # # in case prediction is not matched to any golden answer,
         # # check if golden answer is contained in the context
@@ -80,7 +80,7 @@ def main(args):
         #                 is_from_context = True
         #         if found:
         #             break
-        
+
         # no answer is found in
         is_impossible = False
         if answer_start < 0 or answer_text == "":
@@ -89,7 +89,7 @@ def main(args):
             is_impossible = True
         else:
             assert answer_text == ds_context[answer_start:answer_start+len(answer_text)]
-        
+
         output_data.append({
             'title': ds_title,
             'paragraphs':[{
@@ -106,12 +106,12 @@ def main(args):
                 'id': sample_id
             }]
         })
-        
+
     with open(args.output_path, 'w', encoding='utf-8') as f:
         json.dump({
             'data': output_data
         },f)
-    
+
 
 # ------------------------------------------------------------------------------
 # Main.
