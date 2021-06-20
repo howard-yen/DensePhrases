@@ -46,10 +46,10 @@ from densephrases.models import DensePhrases
 
 logger = logging.getLogger(__name__)
 
-MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
-MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in MODEL_CONFIG_CLASSES), (),)
-print(set([k.split('-')[0] for k in ALL_MODELS]))
+#MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
+#MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+#ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in MODEL_CONFIG_CLASSES), (),)
+#print(set([k.split('-')[0] for k in ALL_MODELS]))
 
 
 def train(args, train_dataset, model, tokenizer):
@@ -589,7 +589,8 @@ def main():
         default=None,
         type=str,
         required=True,
-        help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS),
+        #help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS),
+        help="Path to pre-trained model"
     )
     parser.add_argument(
         "--load_dir",

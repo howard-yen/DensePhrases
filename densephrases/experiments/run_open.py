@@ -39,7 +39,7 @@ from transformers import (
 
 from reader import Reader
 from reranker import Reranker
-from utils import process_sample
+from utils import process_sample, process_reranker_input, process_reader_input
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
@@ -418,6 +418,7 @@ def evaluate_results_kilt(predictions, qids, questions, answers, args, evidences
 
     return result['downstream']['accuracy']
 
+#eval-reranker
 def eval_reranker(args, model=None, tokenizer=None, config=None, prefix=None):
     #wandb setup
     wandb.init(project="DensePhrases-Reranker-Evaluation", notes="", entity="howard-yen", mode="online" if args.wandb else "disabled")
@@ -535,7 +536,7 @@ def eval_reranker(args, model=None, tokenizer=None, config=None, prefix=None):
 
     return evaluate_results(predictions, qids, questions, answers, args, evidences, scores, titles, save_predictions=False)
 
-
+#eval-reader
 def eval_reader(args, model=None, tokenizer=None, config=None):
     #wandb setup
     wandb.init(project="DensePhrases-Reader-Evaluation", notes="", entity="howard-yen", mode="online" if args.wandb else "disabled")
@@ -555,23 +556,23 @@ def eval_reader(args, model=None, tokenizer=None, config=None):
     config = config if config is not None else AutoConfig.from_pretrained(args.config_name if args.config_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
     tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.pretrained_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None)
 
-    model = AutoModelForQuestionAnswering.from_pretrained("ankur310794/roberta-base-squad2-nq", cache_dir="./cache")
+    #model = AutoModelForQuestionAnswering.from_pretrained("ankur310794/roberta-base-squad2-nq", cache_dir="./cache")
 
-    #if model is not None:
-    #    model = model
-    #else:
-    #    model = Reader(config=config)
-    #    if args.load_dir:
-    #        if os.path.isfile(os.path.join(args.load_dir, "reader_model.pt")):
-    #            model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
-    #            logger.info(f'model loaded from {args.load_dir}')
-
-    #        else:
-    #            logger.info('missing reader model, exiting')
-    #            exit()
-    #    else:
-    #        logger.info('missing reader model load dir, exiting')
-    #        exit()
+    if model is not None:
+        model = model
+    else:
+        model = Reader(config=config)
+        if args.load_dir:
+            if os.path.exists(os.path.join(args.load_dir, "pytorch_model.bin")):
+                #model = Reader.from_pretrained(os.path.join(args.load_dir, "reader_model"))
+                model.load_state_dict(torch.load(os.path.join(args.load_dir, "pytorch_model.bin")))
+                logger.info(f'model loaded from {args.load_dir}')
+            else:
+                logger.info('missing reader model, exiting')
+                exit()
+        else:
+            logger.info('missing reader model load dir, exiting')
+            exit()
 
     model.to(device)
     model.eval()
@@ -592,6 +593,8 @@ def eval_reader(args, model=None, tokenizer=None, config=None):
     count = 0
 
     softmax = torch.nn.Softmax(dim=-1)
+
+    SEP_INPUT_ID = 102
 
     with torch.no_grad():
         for qid in tqdm(data):
@@ -618,13 +621,19 @@ def eval_reader(args, model=None, tokenizer=None, config=None):
             token_type_ids = torch.tensor(processed['token_type_ids']).to(device)
 
             #can also calculate loss for the eval set
-            output = model(input_ids=input_ids.view(-1, args.max_seq_length), attention_mask=attention_mask.view(-1, args.max_seq_length), token_type_ids=token_type_ids.view(-1, args.max_seq_length))
+            output = model(input_ids=input_ids.view(-1, M, args.max_seq_length), attention_mask=attention_mask.view(-1, M, args.max_seq_length), token_type_ids=token_type_ids.view(-1, M, args.max_seq_length))
 
-            start_logits = output.start_logits
-            end_logits = output.end_logits
+            #start_logits = output.start_logits
+            #end_logits = output.end_logits
+            start_logits, end_logits, rank_logits = output
 
             start_prob = softmax(start_logits)
             end_prob = softmax(end_logits)
+            rank_prob = softmax(rank_logits)
+
+            # do not let the start or end be [SEP]
+            start_prob[input_ids.view(1, M, -1)==SEP_INPUT_ID] = 0
+            end_prob[input_ids.view(1, M, -1)==SEP_INPUT_ID] = 0
 
             span_prob = torch.bmm(start_prob.view(M, -1, 1), end_prob.view(M, 1, -1))
             span_prob = torch.triu(span_prob)
@@ -641,6 +650,16 @@ def eval_reader(args, model=None, tokenizer=None, config=None):
             offset = processed['offset_mapping']
             new_prediction = [processed['backs'][idx][offset[idx][pos//args.max_seq_length][0]:offset[idx][pos%args.max_seq_length][1]] for idx, pos in enumerate(best_span)]
 
+            rank_prob = rank_prob.view(M)
+
+            _, indices = torch.sort(rank_prob, descending=True)
+
+            new_prediction = [new_prediction[i] for i in indices]
+            evidence = [evidence[i] for i in indices]
+            title = [title[i] for i in indices]
+            score = [score[i] for i in indices]
+
+
             input_ids = input_ids.to('cpu')
             attention_mask = attention_mask.to('cpu')
             token_type_ids = token_type_ids.to('cpu')
@@ -653,192 +672,6 @@ def eval_reader(args, model=None, tokenizer=None, config=None):
             answers.append(answer)
 
     return evaluate_results(new_predictions, qids, questions, answers, args, evidences, scores, titles, save_predictions=False)
-
-def process_reranker_input(args, tokenizer, train_file=None):
-    logger.info(f'Loading reader input dataset from {train_file if train_file is not None else args.train_file}')
-    with open(train_file if train_file is not None else args.train_file, encoding='utf-8') as f:
-        data = json.load(f)['data']
-
-    all_input_ids = []
-    all_token_type_ids = []
-    all_attention_mask = []
-    all_is_impossible = []
-    #all_best_passage = []
-    all_ems = []
-
-    for sample_idx, sample in enumerate(tqdm(data)):
-
-        question = sample['question']
-        answer = sample['answer']
-        predictions = sample['prediction']
-        titles = sample['title']
-        evidences = sample['evidence']
-        scores = sample['score']
-        f1s = sample['f1s']
-        ems = sample['exact_matches']
-        ems = [1 if em else 0 for em in ems]
-
-        if max(ems) < 1:
-            continue
-
-        is_impossible = sample['is_impossible']
-        is_impossible = [1 if imp else 0 for imp in is_impossible]
-
-
-        input_ids = []
-        token_type_ids = []
-        attention_mask = []
-        best = 0
-
-        question_tokens = tokenizer.tokenize(question)
-        if len(question_tokens) > args.max_query_length:
-            question_tokens = question_tokens[0:args.max_query_length]
-
-        for pred_idx, pred in enumerate(predictions):
-            title_tokens = tokenizer.tokenize(titles[pred_idx])
-            pred_tokens = tokenizer.tokenize(pred)
-            passage_tokens = tokenizer.tokenize(evidences[pred_idx])
-            back_tokens = pred_tokens + ['[SEP]'] + title_tokens + ['[SEP]'] + passage_tokens
-
-            #encoded = tokenizer.encode_plus(question, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
-            encoded = tokenizer.encode_plus(question_tokens, text_pair=back_tokens, max_length=args.max_seq_length, padding='max_length', truncation=True, return_token_type_ids=True, return_attention_mask=True, is_split_into_words=True)
-
-            input_ids.append(encoded['input_ids'])
-            token_type_ids.append(encoded['token_type_ids'])
-            attention_mask.append(encoded['attention_mask'])
-
-        # need to pad so ensure the same size in every dimension
-        # replaced by negative sample in batch while training
-        for extra in range(len(predictions), args.top_k):
-            input_ids.append([0 for i in range(args.max_seq_length)])
-            token_type_ids.append([0 for i in range(args.max_seq_length)])
-            attention_mask.append([0 for i in range(args.max_seq_length)])
-            is_impossible.append(-1)
-            ems.append(-1)
-
-        all_input_ids.append(input_ids)
-        all_token_type_ids.append(token_type_ids)
-        all_attention_mask.append(attention_mask)
-        all_is_impossible.append(is_impossible)
-        #all_best_passage.append(best)
-        all_ems.append(ems)
-
-    all_input_ids = torch.tensor(all_input_ids)
-    all_token_type_ids = torch.tensor(all_token_type_ids)
-    all_attention_mask = torch.tensor(all_attention_mask)
-    all_is_impossible = torch.tensor(all_is_impossible)
-    all_ems = torch.tensor(all_ems)
-    #all_best_passage = torch.tensor(all_best_passage)
-
-    dataset = TensorDataset(all_input_ids, all_token_type_ids, all_attention_mask, all_is_impossible, all_ems)
-
-    return dataset
-
-
-def process_reader_input(args, tokenizer, train_file=None):
-    logger.info(f'Loading reader input dataset from {train_file if train_file is not None else args.train_file}')
-    with open(train_file if train_file is not None else args.train_file, encoding='utf-8') as f:
-        data = json.load(f)['data']
-
-    all_input_ids = []
-    all_token_type_ids = []
-    all_attention_mask = []
-    all_start_pos = []
-    all_end_pos = []
-    all_is_impossible = []
-    all_best_passage = []
-
-    for sample_idx, sample in enumerate(tqdm(data)):
-        question = sample['question']
-        answer = sample['answer']
-        predictions = sample['prediction']
-        titles = sample['title']
-        evidences = sample['evidence']
-        start_pos = sample['start_pos']
-        end_pos = sample['end_pos']
-        scores = sample['score']
-
-        is_impossible = sample['is_impossible']
-        is_impossible = [1 if imp else 0 for imp in is_impossible]
-
-        input_ids = []
-        token_type_ids = []
-        attention_mask = []
-        starts = []
-        ends = []
-        best = -1
-
-        question_tokens = tokenizer.tokenize(question)
-        if len(question_tokens) > args.max_query_length:
-            question_tokens = question_tokens[0:args.max_query_length]
-
-        for pred_idx, pred in enumerate(predictions):
-            title_tokens = tokenizer.tokenize(titles[pred_idx])
-            front_tokens = question_tokens # + ['[SEP]'] + title_tokens
-            # CLS + 2 SEP
-            before_passage_length = len(question_tokens) + len(title_tokens) + 3
-
-            # get the start and ending token index for the answer
-            if is_impossible[pred_idx]:
-                back_tokens = tokenizer.tokenize(evidences[pred_idx])
-                # CLS token is at index 0 and represents the no answer token
-                starts.append(0)
-                ends.append(0)
-            else:
-                before_answer = tokenizer.tokenize(evidences[pred_idx][0:start_pos[pred_idx]-1])
-                answer_tokens = tokenizer.tokenize(evidences[pred_idx][start_pos[pred_idx]:end_pos[pred_idx]+1])
-                after_answer = tokenizer.tokenize(evidences[pred_idx][end_pos[pred_idx]+1:])
-                back_tokens = before_answer + answer_tokens + after_answer
-
-                # before passage + before answer + answer token length must be smaller than args.max_seq_length or the reader won't be able to even see it
-                if before_passage_length + len(before_answer) < args.max_seq_length:
-                    starts.append(before_passage_length + len(before_answer))
-                    _end_pos = before_passage_length + len(before_answer) + len(answer_tokens) - 1
-                    ends.append(_end_pos if _end_pos < args.max_seq_length else args.max_seq_length-1)
-                    if best == -1:
-                        best = pred_idx
-                else:
-                    starts.append(0)
-                    ends.append(0)
-                    is_impossible[pred_idx] = 1
-
-            back_tokens = title_tokens + ['[SEP]'] + back_tokens
-
-            encoded = tokenizer.encode_plus(front_tokens, text_pair=back_tokens, max_length=args.max_seq_length, pad_to_max_length=True, return_token_type_ids=True, return_attention_mask=True)
-
-            input_ids.append(encoded['input_ids'])
-            token_type_ids.append(encoded['token_type_ids'])
-            attention_mask.append(encoded['attention_mask'])
-
-        # need to pad so ensure the same size in every dimension
-        # replaced by negative sample in batch while training
-        for extra in range(len(predictions), args.top_k):
-            input_ids.append([0 for i in range(args.max_seq_length)])
-            token_type_ids.append([0 for i in range(args.max_seq_length)])
-            attention_mask.append([0 for i in range(args.max_seq_length)])
-            starts.append(0)
-            ends.append(0)
-            is_impossible.append(-1)
-
-        all_input_ids.append(input_ids)
-        all_token_type_ids.append(token_type_ids)
-        all_attention_mask.append(attention_mask)
-        all_start_pos.append(starts)
-        all_end_pos.append(ends)
-        all_is_impossible.append(is_impossible)
-        all_best_passage.append(best)
-
-    all_input_ids = torch.tensor(all_input_ids)
-    all_token_type_ids = torch.tensor(all_token_type_ids)
-    all_attention_mask = torch.tensor(all_attention_mask)
-    all_start_pos = torch.tensor(all_start_pos)
-    all_end_pos = torch.tensor(all_end_pos)
-    all_is_impossible = torch.tensor(all_is_impossible)
-    all_best_passage = torch.tensor(all_best_passage)
-
-    dataset = TensorDataset(all_input_ids, all_token_type_ids, all_attention_mask, all_start_pos, all_end_pos, all_is_impossible, all_best_passage)
-
-    return dataset
 
 def train_reranker(args):
     #wandb setup
@@ -873,7 +706,7 @@ def train_reranker(args):
             #model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
             logger.info(f'model loaded from {args.load_dir}')
 
-    train_dataset = process_reranker_input(args, tokenizer)
+    train_dataset = process_reranker_input(tokenizer, train_file=args.train_file, max_query_length=args.max_query_length, max_seq_length=args.max_seq_length, top_k=args.top_k)
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
@@ -1159,7 +992,7 @@ def train_reader(args):
             #model.load_state_dict(torch.load(os.path.join(args.load_dir, "reader_model.pt")))
             logger.info(f'model loaded from {args.load_dir}')
 
-    train_dataset = process_reader_input(args, tokenizer)
+    train_dataset = process_reader_input(tokenizer, args.train_file, max_query_length=args.max_query_length, max_seq_length=args.max_seq_length, top_k=args.top_k)
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
@@ -1389,7 +1222,7 @@ def train_reader(args):
                     #model_to_save.save_pretrained(output_dir)
 
                     #torch.save(model_to_save.state_dict(), os.path.join(output_dir, 'reader_model.pt'))
-                    reader.save_pretrained(os.path.join(output_dir, 'reader_model'))
+                    model_to_save.save_pretrained(os.path.join(output_dir, 'reader_model'))
 
                     torch.save(args, os.path.join(output_dir, "training_args.bin"))
                     logger.info("Saving model checkpoint to %s", output_dir)

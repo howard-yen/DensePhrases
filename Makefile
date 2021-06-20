@@ -49,6 +49,9 @@ nqsqd-param:
 	$(eval LAMBDA_NEG=4.0)
 	$(eval TEACHER_NAME=spanbert-base-cased-sqdnq)
 
+simple-test:
+	python test.py
+
 # Command with default setting. Use train-single-nq instead.
 train-single:
 	python -m densephrases.experiments.run_single \
@@ -312,12 +315,12 @@ eval-od: dump-dir model-name nq-open-data
 		--dump_dir $(DUMP_DIR) \
 		--index_dir start/1048576_flat_PQ96_8 \
 		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
-		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
+		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) 
 		$(OPTIONS)
 
-eval-bert: dump-dir model-name nq-open-data
+eval-reader: dump-dir model-name nq-open-data
 	python -m densephrases.experiments.run_open \
-		--run_mode eval_results_bert \
+		--run_mode eval_reader \
 		--model_type bert \
 		--pretrained_name_or_path SpanBERT/spanbert-base-cased \
 		--cuda \
@@ -327,8 +330,25 @@ eval-bert: dump-dir model-name nq-open-data
 		--index_dir start/1048576_flat_PQ96_8 \
 		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
 		--test_path $(DPH_SAVE_DIR)/dph-nqsqd-pb2_pq96-nq-10/pred/test_preprocessed_3610.pred \
-		--load_dir $(DPH_SAVE_DIR)/reader \
+		--load_dir $(DPH_SAVE_DIR)/reader/checkpoint-8000/reader_model \
+		--max_seq_length 384 \
 		$(OPTIONS)
+
+eval-reranker: dump-dir model-name nq-open-data
+	python -m densephrases.experiments.run_open \
+		--run_mode eval_reranker \
+		--model_type bert \
+		--pretrained_name_or_path SpanBERT/spanbert-base-cased \
+		--cuda \
+		--debug \
+		--eval_batch_size 12 \
+		--dump_dir $(DUMP_DIR) \
+		--index_dir start/1048576_flat_PQ96_8 \
+		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--test_path $(DPH_SAVE_DIR)/dph-nqsqd-pb2_pq96-nq-10/pred/test_preprocessed_3610.pred \
+		--load_dir $(DPH_SAVE_DIR)/reranker/checkpoint-25000 \
+		$(OPTIONS)
+
 
 # get the predictions from a training file, 
 # same as eval-od but TRAIN_DATA instead for test_path
@@ -345,11 +365,12 @@ get-predictions: dump-dir model-name nq-open-data
 		--test_path $(DPH_DATA_DIR)/$(TRAIN_DATA) \
 		$(OPTIONS)
 
-# Train the bert model used for reranking
-train-bert: nq-open-data nq-param pbn-param
+# Train the bert model used for reranking and reading
+train-reader: nq-open-data nq-param pbn-param
 	python -m densephrases.experiments.run_open \
-		--run_mode train_bert \
+		--run_mode train_reader \
 		--cuda \
+		--fp16 \
 		--model_type bert \
 		--pretrained_name_or_path SpanBERT/spanbert-base-cased \
 		--data_dir $(DPH_DATA_DIR)/single-qa \
@@ -358,8 +379,36 @@ train-bert: nq-open-data nq-param pbn-param
 		--predict_file $(DEV_DATA) \
 		--per_gpu_train_batch_size $(BS) \
 		--learning_rate $(LR) \
-		--num_train_epochs 2.0 \
+		--learning_rate 3e-5 \
+		--num_train_epochs 3.0 \
+		--append_title \
+		--output_dir $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--load_dir $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--index_dir start/1048576_flat_PQ96_8 \
+		--query_encoder_path $(DPH_SAVE_DIR)/$(MODEL_NAME) \
+		--test_path $(DPH_DATA_DIR)/$(TEST_DATA) \
+		--top_k 10 \
+		--per_gpu_train_batch_size 1 \
+		--save_steps 1000 \
+		--wandb \
+		--gradient_accumulation_steps 32\
+		$(OPTIONS) 
+
+# Train the bert model used for reranking
+train-reranker: nq-open-data nq-param pbn-param
+	python -m densephrases.experiments.run_open \
+		--run_mode train_reranker \
+		--cuda \
 		--fp16 \
+		--model_type bert \
+		--pretrained_name_or_path SpanBERT/spanbert-base-cased \
+		--data_dir $(DPH_DATA_DIR)/single-qa \
+		--cache_dir $(DPH_CACHE_DIR) \
+		--train_file reranker_inputs.json \
+		--predict_file $(DEV_DATA) \
+		--per_gpu_train_batch_size $(BS) \
+		--learning_rate 1e-5 \
+		--num_train_epochs 3.0 \
 		--append_title \
 		--output_dir $(DPH_SAVE_DIR)/$(MODEL_NAME) \
 		--load_dir $(DPH_SAVE_DIR)/$(MODEL_NAME) \
@@ -370,7 +419,9 @@ train-bert: nq-open-data nq-param pbn-param
 		--per_gpu_train_batch_size 1 \
 		--save_steps 5000 \
 		--wandb \
+		--gradient_accumulation_steps 16\
 		$(OPTIONS) 
+		#--gradient_accumulation_steps 4\
 
 train-query: dump-dir model-name nq-open-data
 	python -m densephrases.experiments.run_open \
