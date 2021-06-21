@@ -50,9 +50,9 @@ class Reranker(PreTrainedModel):
         return rank_logits.view(N, M)
         #return start_loss.view(N, M, L), end_loss.view(N, M, L), rank_loss.view(N, M)
 
-    def compute_loss(self, rank_logits, is_impossible, ems, N, M, L):
+    def compute_loss(self, rank_prob, is_impossible, ems, N, M, L):
         #print('em logits:', rank_logits[ems==1])
-        loss = -torch.log(torch.sum(rank_logits[ems==1], dim=-1))
+        loss = -torch.log(torch.sum(rank_prob[ems==1], dim=-1))
         #print('loss:', loss)
         loss = loss.mean()
 

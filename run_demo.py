@@ -8,7 +8,6 @@ import requests
 import logging
 import math
 import copy
-import wandb
 import string
 
 from tqdm import tqdm
@@ -20,8 +19,8 @@ from tornado.httpserver import HTTPServer
 from tornado.ioloop import IOLoop
 from requests_futures.sessions import FuturesSession
 
-from densephrases.experiments.run_open import load_query_encoder, load_phrase_index, load_qa_pairs, evaluate_results, \
-        get_query2vec, evaluate_results_kilt
+from eval_phrase_retrieval import evaluate_results, evaluate_results_kilt
+from densephrases.utils.open_utils import load_query_encoder, load_phrase_index, load_qa_pairs, get_query2vec
 from densephrases.utils.squad_utils import get_cq_dataloader, TrueCaser
 from densephrases.utils.embed_utils import get_cq_results
 
@@ -37,7 +36,7 @@ class DensePhrasesInterface(object):
         self.base_ip = args.base_ip
         self.query_port = args.query_port
         self.index_port = args.index_port
-        self.truecase = TrueCaser(os.path.join(os.environ['DPH_DATA_DIR'], args.truecase_path))
+        self.truecase = TrueCaser(os.path.join(os.environ['DATA_DIR'], args.truecase_path))
 
     def serve_query_encoder(self, query_port, args, inmemory=False, batch_size=64, query_encoder=None, tokenizer=None):
         device = 'cuda' if args.cuda else 'cpu'
@@ -69,7 +68,7 @@ class DensePhrasesInterface(object):
         args.examples_path = os.path.join('densephrases/demo/static', args.examples_path)
 
         # Load mips
-        mips = load_phrase_index(args, load_light=args.load_light)
+        mips = load_phrase_index(args)
         app = Flask(__name__, static_url_path='/static')
         app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
         CORS(app)
@@ -271,7 +270,7 @@ class DensePhrasesInterface(object):
 
     def eval_request(self, args):
         # Load dataset
-        qids, questions, answers = load_qa_pairs(args.test_path, args)
+        qids, questions, answers, _ = load_qa_pairs(args.test_path, args)
 
         # Run batch_query and evaluate
         step = args.eval_batch_size
@@ -302,19 +301,18 @@ class DensePhrasesInterface(object):
             evidences += evidence
             titles += title
             scores += score
-            all_tokens += q_tokens
         latency = time()-start_time
         logger.info(f'{time()-start_time:.3f} sec for {num_q} questions => {num_q/(time()-start_time):.1f} Q/Sec')
         eval_fn = evaluate_results if not args.is_kilt else evaluate_results_kilt
         eval_fn(
-            predictions, qids, questions, answers, args, evidences=evidences, scores=scores, titles=titles, q_tokens=all_tokens,
+            predictions, qids, questions, answers, args, evidences=evidences, scores=scores, titles=titles,
         )
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # QueryEncoder
-    parser.add_argument('--model_type', default=None, type=str)
+    parser.add_argument('--model_type', default='bert', type=str)
     parser.add_argument("--pretrained_name_or_path", default='SpanBERT/spanbert-base-cased', type=str)
     parser.add_argument("--config_name", default="", type=str)
     parser.add_argument("--tokenizer_name", default="", type=str)
@@ -360,8 +358,7 @@ if __name__ == '__main__':
     parser.add_argument('--cuda', default=False, action='store_true')
     parser.add_argument('--draft', default=False, action='store_true')
     parser.add_argument('--debug', default=False, action='store_true')
-    parser.add_argument('--wandb', default=False, action='store_true')
-    parser.add_argument('--load_light', default=False, action='store_true')
+    parser.add_argument('--save_pred', default=False, action='store_true')
     parser.add_argument('--seed', default=1992, type=int)
     args = parser.parse_args()
 

@@ -3,6 +3,7 @@ import json
 import os
 import random
 
+import pickle
 import torch
 import faiss
 import h5py
@@ -100,6 +101,8 @@ def sample_data(dump_paths, doc_sample_ratio=0.2, vec_sample_ratio=0.2, seed=29,
             groups = [doc_group]
             for group in groups:
                 start_set = group['start'][:]
+                if len(start_set.shape) < 2:
+                    continue
                 num_start, d = start_set.shape
                 if num_start == 0: continue
                 sampled_start_idxs = np.random.choice(num_start, int(vec_sample_ratio * num_start))
@@ -111,7 +114,10 @@ def sample_data(dump_paths, doc_sample_ratio=0.2, vec_sample_ratio=0.2, seed=29,
     for dump in dumps:
         dump.close()
 
-    return start_out
+    avg_vec = np.mean(start_out, axis=0, keepdims=True)
+    std_vec = np.std(start_out, axis=0, keepdims=True)
+
+    return start_out, avg_vec, std_vec
 
 
 def train_index(start_data, quantizer_path, trained_index_path, num_clusters,
@@ -119,15 +125,24 @@ def train_index(start_data, quantizer_path, trained_index_path, num_clusters,
     ds = start_data.shape[1]
     quantizer = faiss.IndexFlatIP(ds)
 
+    # Used only for reimplementation
     if fine_quant == 'SQ4':
         start_index = faiss.IndexIVFScalarQuantizer(
             quantizer, ds, num_clusters, faiss.ScalarQuantizer.QT_4bit, faiss.METRIC_INNER_PRODUCT
         )
-    elif 'PQ' in fine_quant:
-        code_size = int(fine_quant.split('_')[0][2:])
-        bits_per_sub = int(fine_quant.split('_')[1])
-        assert bits_per_sub == 8
-        start_index = faiss.IndexIVFPQ(quantizer, ds, num_clusters, code_size, bits_per_sub, faiss.METRIC_INNER_PRODUCT)
+
+    # Default index type
+    elif 'OPQ' in fine_quant:
+        code_size = int(fine_quant[fine_quant.index('OPQ')+3:])
+        if hnsw:
+            start_index = faiss.IndexHNSWPQ(ds, "HNSW32,PQ96", faiss.METRIC_INNER_PRODUCT)
+        else:
+            opq_matrix = faiss.OPQMatrix(ds, code_size)
+            opq_matrix.niter = 10
+            sub_index = faiss.IndexIVFPQ(quantizer, ds, num_clusters, code_size, 8, faiss.METRIC_INNER_PRODUCT)
+            start_index = faiss.IndexPreTransform(opq_matrix, sub_index)
+    elif 'none' in fine_quant:
+        start_index = faiss.IndexFlatIP(ds)
     else:
         raise ValueError(fine_quant)
 
@@ -147,14 +162,19 @@ def train_index(start_data, quantizer_path, trained_index_path, num_clusters,
         start_index.train(start_data)
 
     # Make sure to set direct map again
-    start_index.make_direct_map()
-    start_index.set_direct_map_type(faiss.DirectMap.Hashtable)
+    if 'none' not in fine_quant:
+        index_ivf = faiss.extract_index_ivf(start_index)
+        index_ivf.make_direct_map()
+        index_ivf.set_direct_map_type(faiss.DirectMap.Hashtable)
     faiss.write_index(start_index, trained_index_path)
 
 
-def add_with_offset(start_index, start_data, start_valids, start_total, offset):
-    start_ids = (np.arange(start_data.shape[0]) + offset + start_total).astype(np.int64)
-    start_index.add_with_ids(start_data, start_ids)
+def add_with_offset(start_index, start_data, start_valids, start_total, offset, fine_quant):
+    if 'none' in fine_quant:
+        start_index.add(start_data)
+    else:
+        start_ids = (np.arange(start_data.shape[0]) + offset + start_total).astype(np.int64)
+        start_index.add_with_ids(start_data, start_ids)
 
     if len(start_valids) != sum(start_valids):
         print('start invalid')
@@ -162,15 +182,17 @@ def add_with_offset(start_index, start_data, start_valids, start_total, offset):
 
 def add_to_index(dump_paths, trained_index_path, target_index_path, idx2id_path,
                  num_docs_per_add=1000, cuda=False, fine_quant='SQ4', offset=0, norm_th=999,
-                 ignore_ids=None):
+                 ignore_ids=None, avg_vec=None, std_vec=None):
 
     sidx2doc_id = []
     sidx2word_id = []
     dumps = [h5py.File(dump_path, 'r') for dump_path in dump_paths]
     print('reading %s' % trained_index_path)
     start_index = faiss.read_index(trained_index_path)
-    start_index.make_direct_map()
-    start_index.set_direct_map_type(faiss.DirectMap.Hashtable)
+    if 'none' not in fine_quant:
+        index_ivf = faiss.extract_index_ivf(start_index)
+        index_ivf.make_direct_map()
+        index_ivf.set_direct_map_type(faiss.DirectMap.Hashtable)
 
     if cuda:
         if 'PQ' in fine_quant:
@@ -198,6 +220,8 @@ def add_to_index(dump_paths, trained_index_path, target_index_path, idx2id_path,
             if ignore_ids is not None and doc_idx in ignore_ids:
                 continue
             num_start = doc_group['start'].shape[0]
+            # if len(doc_group['start'].shape) < 2:
+            #     continue
             if num_start == 0: continue
             cnt += 1
 
@@ -215,7 +239,7 @@ def add_to_index(dump_paths, trained_index_path, target_index_path, idx2id_path,
             if len(starts) > 0 and ((i % num_docs_per_add == 0) or (i == dump_length - 1)):
                 print('adding at %d' % (i+1))
                 add_with_offset(
-                    start_index, concat_vectors(starts), concat_vectors(start_valids), start_total_prev, offset
+                    start_index, concat_vectors(starts), concat_vectors(start_valids), start_total_prev, offset, fine_quant,
                 )
                 start_total_prev = start_total
                 starts = []
@@ -223,7 +247,7 @@ def add_to_index(dump_paths, trained_index_path, target_index_path, idx2id_path,
         if len(starts) > 0:
             print('final adding at %d' % (i+1))
             add_with_offset(
-                start_index, concat_vectors(starts), concat_vectors(start_valids), start_total_prev, offset
+                start_index, concat_vectors(starts), concat_vectors(start_valids), start_total_prev, offset, fine_quant,
             )
             start_total_prev = start_total
     print('number of docs', cnt)
@@ -323,15 +347,19 @@ def run_index(args):
         if args.replace or not os.path.exists(args.quantizer_path):
             if not os.path.exists(args.index_dir):
                 os.makedirs(args.index_dir)
-            start_data = sample_data(
+            start_data, avg_vec, std_vec = sample_data(
                 dump_paths, doc_sample_ratio=args.doc_sample_ratio, vec_sample_ratio=args.vec_sample_ratio,
                 norm_th=args.norm_th
             )
+            with open(os.path.join(args.index_dir, 'avg_vec.pkl'), 'wb') as fp:
+                pickle.dump(avg_vec, fp)
+            with open(os.path.join(args.index_dir, 'std_vec.pkl'), 'wb') as fp:
+                pickle.dump(std_vec, fp)
 
     if args.stage in ['all', 'fine']:
         if args.replace or not os.path.exists(args.trained_index_path):
             if start_data is None:
-                start_data = sample_data(
+                start_data, avg_vec, std_vec = sample_data(
                     dump_paths,
                     doc_sample_ratio=args.doc_sample_ratio, vec_sample_ratio=args.vec_sample_ratio,
                     norm_th=args.norm_th,
@@ -344,6 +372,11 @@ def run_index(args):
 
     if args.stage in ['all', 'add']:
         if args.replace or not os.path.exists(args.index_path):
+            with open(os.path.join(args.index_dir, 'avg_vec.pkl'), 'rb') as fp:
+                avg_vec = pickle.load(fp)
+            with open(os.path.join(args.index_dir, 'std_vec.pkl'), 'rb') as fp:
+                std_vec = pickle.load(fp)
+
             if args.dump_paths is not None:
                 dump_paths = args.dump_paths
                 if not os.path.exists(args.subindex_dir):
@@ -351,7 +384,7 @@ def run_index(args):
             add_to_index(
                 dump_paths, args.trained_index_path, args.index_path, args.idx2id_path,
                 cuda=args.cuda, num_docs_per_add=args.num_docs_per_add, offset=args.offset, norm_th=args.norm_th,
-                fine_quant=args.fine_quant
+                fine_quant=args.fine_quant, avg_vec=avg_vec, std_vec=std_vec
             )
 
     if args.stage == 'merge':

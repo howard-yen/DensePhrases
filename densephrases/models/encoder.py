@@ -19,10 +19,9 @@ class DensePhrases(PreTrainedModel):
                  tokenizer,
                  pretrained=None,
                  transformer_cls=None,
-                 lambda_kl=False,
-                 lambda_neg=False,
-                 lambda_flt=False,
-                 pbn_size=False):
+                 lambda_kl=0.0,
+                 lambda_neg=0.0,
+                 lambda_flt=0.0):
         super().__init__(config)
         self.tokenizer = tokenizer
 
@@ -33,13 +32,12 @@ class DensePhrases(PreTrainedModel):
         self.lambda_kl = lambda_kl
         self.lambda_neg = lambda_neg
         self.lambda_flt = lambda_flt
-        self.pbn_size = pbn_size
         self.pre_batch = None
         self.apply(self.init_weights)
 
         # Load transformer after init
         assert pretrained is not None or transformer_cls is not None
-        logger.info('Pre-trained LM loaded' if pretrained else 'Not initialized but will be loaded')
+        logger.info('Pre-trained LM loaded' if pretrained else 'Pre-trained DensePhrases must be loaded')
         if lambda_kl > 0:
             logger.info("Teacher initialized for distillation. Weights will be loaded.")
             self.cross_encoder = None
@@ -296,7 +294,7 @@ class DensePhrases(PreTrainedModel):
         self,
         input_ids_=None, attention_mask_=None, token_type_ids_=None,
         start_vecs=None, end_vecs=None,
-        targets=None,
+        targets=None, p_targets=None, # TODO: reimplement p_targets supervision
     ):
         # Skip if no targets for phrases
         if start_vecs is not None:

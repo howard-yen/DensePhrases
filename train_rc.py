@@ -37,10 +37,9 @@ from transformers import (
     AutoTokenizer,
     get_linear_schedule_with_warmup,
 )
-import densephrases.utils.squad_utils as squad_utils
+from densephrases.utils.squad_utils import SquadResult, load_and_cache_examples
 from densephrases.utils.single_utils import set_seed, to_list, to_numpy, backward_compat
 from densephrases.utils.squad_metrics import compute_predictions_log_probs, compute_predictions_logits, squad_evaluate
-from densephrases.utils.embed_utils import write_phrases
 from densephrases.models import DensePhrases
 
 
@@ -318,7 +317,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                     raise NotImplementedError
                 else:
                     start_logits, end_logits, sft_logits, eft_logits = output
-                    result = squad_utils.SquadResult(
+                    result = SquadResult(
                         unique_id,
                         start_logits=start_logits,
                         end_logits=end_logits,
@@ -371,104 +370,6 @@ def evaluate(args, model, tokenizer, prefix=""):
     return results, stat
 
 
-def dump_phrases(args, model, tokenizer):
-    if not os.path.exists(os.path.join(args.output_dir, 'dump/phrase')):
-        os.makedirs(os.path.join(args.output_dir, 'dump/phrase'))
-
-    start_time = timeit.default_timer()
-    if ':' not in args.predict_file:
-        predict_files = [args.predict_file]
-        offsets = [0]
-        output_dump_file = os.path.join(
-            args.output_dir, "dump/phrase/{}.hdf5".format(os.path.splitext(os.path.basename(args.predict_file))[0])
-        )
-    else:
-        dirname = os.path.dirname(args.predict_file)
-        basename = os.path.basename(args.predict_file)
-        start, end = list(map(int, basename.split(':')))
-        output_dump_file = os.path.join(
-            args.output_dir, f"dump/phrase/{start}-{end}.hdf5"
-        )
-
-        # skip files if possible
-        if os.path.exists(output_dump_file):
-            with h5py.File(output_dump_file, 'r') as f:
-                dids = list(map(int, f.keys()))
-            start = int(max(dids) / 1000)
-            logger.info('%s exists; starting from %d' % (output_dump_file, start))
-
-        names = [str(i).zfill(4) for i in range(start, end)]
-        predict_files = [os.path.join(dirname, name) for name in names]
-        offsets = [int(each) * 1000 for each in names]
-
-    for offset, predict_file in zip(offsets, predict_files):
-        args.predict_file = predict_file
-        logger.info(f"***** Pre-processing contexts from {args.predict_file} *****")
-        dataset, examples, features = load_and_cache_examples(
-            args, tokenizer, evaluate=True, output_examples=True, context_only=True
-        )
-        for example in examples:
-            example.doc_idx += offset
-
-        args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-
-        # Note that DistributedSampler samples randomly
-        eval_sampler = SequentialSampler(dataset)
-        eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
-        logger.info(f"***** Dumping Phrases from {args.predict_file} *****")
-        logger.info("  Num examples = %d", len(dataset))
-        logger.info("  Batch size = %d", args.eval_batch_size)
-        start_time = timeit.default_timer()
-
-        def get_phrase_results():
-            for batch in tqdm(eval_dataloader, desc="Dumping"):
-                model.eval()
-                batch = tuple(t.to(args.device) for t in batch)
-
-                with torch.no_grad():
-                    inputs = {
-                        "input_ids": batch[0],
-                        "attention_mask": batch[1],
-                        "token_type_ids": batch[2],
-                        "return_phrase": True,
-                    }
-                    feature_indices = batch[3]
-                    outputs = model(**inputs)
-
-                for i, feature_index in enumerate(feature_indices):
-                    # TODO: i and feature_index are the same number! Simplify by removing enumerate?
-                    eval_feature = features[feature_index.item()]
-                    unique_id = int(eval_feature.unique_id)
-
-                    output = [
-                        to_numpy(output[i]) if type(output) != dict else {k: to_numpy(v[i]) for k, v in output.items()}
-                        for output in outputs
-                    ]
-
-                    if len(output) != 4:
-                        raise NotImplementedError
-                    else:
-                        start_vecs, end_vecs, sft_logits, eft_logits = output
-                        result = squad_utils.ContextResult(
-                            unique_id,
-                            start_vecs=start_vecs,
-                            end_vecs=end_vecs,
-                            sft_logits=sft_logits,
-                            eft_logits=eft_logits,
-                        )
-                    yield result
-
-        write_phrases(
-            examples, features, get_phrase_results(), args.max_answer_length, args.do_lower_case, tokenizer,
-            output_dump_file, args.filter_threshold, args.verbose_logging,
-            args.dense_offset, args.dense_scale, has_title=args.append_title,
-        )
-
-        evalTime = timeit.default_timer() - start_time
-        logger.info("Evaluation done in total %f secs (%f sec per example)", evalTime, evalTime / len(dataset))
-
-
 def filter_test(args, model, tokenizer):
     original_filter_threshold = args.filter_threshold
     thresholds = [float(th) for th in args.filter_threshold_list.split(',')]
@@ -477,8 +378,6 @@ def filter_test(args, model, tokenizer):
     results = {}
     for idx, threshold in enumerate(thresholds):
         logger.info(f"Filter={threshold:.2f}")
-        if idx > 0:
-            args.overwrite_cache = False
         args.filter_threshold = threshold
         result, stat = evaluate(args, model, tokenizer, prefix=str(threshold))
         result = dict(
@@ -493,84 +392,6 @@ def filter_test(args, model, tokenizer):
     for idx in range(0, len(results), 3):
         print(f"{thresholds[idx//3]:.1f}, {results[idx][1]:.2f}, {results[idx+1][1]:.2f}, {results[idx+2][1]:.3f}")
     args.filter_threshold = original_filter_threshold
-
-
-def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False, context_only=False,
-    skip_no_answer=False):
-    if args.local_rank not in [-1, 0] and not evaluate:
-        # Make sure only the first process in distributed training process the dataset, and the others will use the cache
-        torch.distributed.barrier()
-
-    # Load data features from cache or dataset file
-    input_dir = args.data_dir if args.data_dir else "."
-    cached_features_file = os.path.join(
-        args.cache_dir,
-        "cached_{}_{}_{}".format(
-            os.path.basename(args.predict_file if evaluate else args.train_file).replace('.', '_'),
-            list(filter(None, args.output_dir.split("/"))).pop(),
-            str(args.max_seq_length)
-        ),
-    )
-
-    # Init features and dataset from cache if it exists
-    if os.path.exists(cached_features_file) and not args.overwrite_cache:
-        logger.info("Loading features from cached file %s", cached_features_file)
-        features_and_dataset = torch.load(cached_features_file)
-        features, dataset, examples = (
-            features_and_dataset["features"],
-            features_and_dataset["dataset"],
-            features_and_dataset["examples"],
-        )
-    else:
-        logger.info("Creating features from dataset file at %s", input_dir)
-
-        if not args.data_dir and ((evaluate and not args.predict_file) or (not evaluate and not args.train_file)):
-            try:
-                import tensorflow_datasets as tfds
-            except ImportError:
-                raise ImportError("If not data_dir is specified, tensorflow_datasets needs to be installed.")
-
-            if args.version_2_with_negative:
-                logger.warn("tensorflow_datasets does not handle version 2 of SQuAD.")
-
-            tfds_examples = tfds.load("squad")
-            examples = squad_utils.SquadV1Processor().get_examples_from_dataset(tfds_examples, evaluate=evaluate)
-        else:
-            processor = squad_utils.SquadV2Processor() if args.version_2_with_negative else squad_utils.SquadV1Processor()
-            if evaluate:
-                examples = processor.get_dev_examples(args.data_dir, filename=args.predict_file, draft=args.draft,
-                    context_only=context_only, args=args)
-            else:
-                examples = processor.get_train_examples(args.data_dir, filename=args.train_file, draft=args.draft,
-                    context_only=context_only, skip_no_answer=skip_no_answer, args=args)
-
-        features, dataset = squad_utils.squad_convert_examples_to_features(
-            examples=examples,
-            tokenizer=tokenizer,
-            max_seq_length=args.max_seq_length,
-            doc_stride=args.doc_stride,
-            max_query_length=args.max_query_length,
-            is_training=not evaluate,
-            return_dataset="pt",
-            threads=args.threads,
-            context_only=context_only,
-            append_title=args.append_title,
-            skip_no_answer=skip_no_answer,
-        )
-
-        if args.local_rank in [-1, 0]:
-            # logger.info("Saving features into cached file %s", cached_features_file)
-            # torch.save({"features": features, "dataset": dataset, "examples": examples}, cached_features_file)
-            logger.info("We don't save cache")
-
-    if args.local_rank == 0 and not evaluate:
-        # Make sure only the first process in distributed training process the dataset, and the others will use the cache
-        torch.distributed.barrier()
-
-    # import pdb; pdb.set_trace() # Debug here for tokenization
-    if output_examples:
-        return dataset, examples, features
-    return dataset
 
 
 def main():
@@ -702,7 +523,6 @@ def main():
     parser.add_argument("--pbn_tolerance", default=9999, type=int, help="pre-batch tolerance epoch")
     parser.add_argument("--append_title", action="store_true", help="Whether to append title in context.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
-    parser.add_argument("--do_dump", action="store_true", help="Whether to run dumping on the dev set.")
     parser.add_argument("--do_filter_test", action="store_true", help="Whether to test filters.")
     parser.add_argument("--truecase_path", default='truecase/english_with_questions.dist', type=str)
     parser.add_argument(
@@ -775,9 +595,6 @@ def main():
         "--overwrite_output_dir", action="store_true", help="Overwrite the content of the output directory"
     )
     parser.add_argument(
-        "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
-    )
-    parser.add_argument(
         "--draft", action="store_true", help="Run draft mode to use 20 examples only"
     )
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
@@ -796,8 +613,6 @@ def main():
         "See details at https://nvidia.github.io/apex/amp.html",
     )
 
-    parser.add_argument('--dense_offset', default=-2, type=float) # Originally -2
-    parser.add_argument('--dense_scale', default=20, type=float) # Originally 20
     parser.add_argument("--threads", type=int, default=20, help="multiple threads for converting example to features")
     args = parser.parse_args()
 
@@ -895,7 +710,6 @@ def main():
         lambda_kl=args.lambda_kl,
         lambda_neg=args.lambda_neg,
         lambda_flt=args.lambda_flt,
-        pbn_size=args.pbn_size,
     )
     logger.info('Number of model params: {:,}'.format(sum(p.numel() for p in model.parameters())))
 
@@ -1018,22 +832,6 @@ def main():
                 {"Eval EM": result['exact_final'], "Eval F1": result['f1_final'], "loss": tr_loss}, step=global_step,
         )
         logger.info("Results: {}".format(result))
-
-    # Dump phrases
-    if args.do_dump:
-        assert args.load_dir
-        args.draft = False
-
-        # Load only phrase encoder
-        model.load_state_dict(backward_compat(
-            torch.load(os.path.join(args.load_dir, "pytorch_model.bin"), map_location=torch.device('cpu'))
-        ))
-        del model.query_start_encoder
-        del model.query_end_encoder
-        model.to(args.device)
-        logger.info(f'DensePhrases loaded from {args.load_dir} having {MODEL_MAPPING[config.__class__]}')
-        logger.info('Number of model params while dumping: {:,}'.format(sum(p.numel() for p in model.parameters())))
-        dump_phrases(args, model, tokenizer)
 
 
 if __name__ == "__main__":
