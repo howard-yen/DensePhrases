@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data.distributed import DistributedSampler
 from transformers import BertTokenizer, BertModel, BertForMaskedLM, AutoTokenizer, AutoConfig, AutoModel
 import json
 from tqdm import tqdm

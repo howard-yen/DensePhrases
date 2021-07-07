@@ -21,6 +21,8 @@ from densephrases.utils.eval_utils import normalize_answer, f1_score, exact_matc
 from densephrases.utils.open_utils import load_query_encoder, load_phrase_index, get_query2vec, load_qa_pairs
 from eval_phrase_retrieval import evaluate_results
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
+from torch.utils.data.distributed import DistributedSampler
+from eval_reader import eval_reader
 
 from transformers import (
     MODEL_MAPPING,
@@ -146,6 +148,7 @@ def train_reader(args):
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
+    logger.info("  Number of GPU = %d", args.n_gpu)
     logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
     logger.info(
         "  Total train batch size (w. parallel, distributed & accumulation) = %d",
@@ -248,12 +251,13 @@ def train_reader(args):
             #        inputs['attention_mask'][im_idx][args.top_k - replace_count + rep_idx] = torch.tensor(new_encoded['attention_mask']).to(device)
 
             loss = model(**inputs)
-            epoch_iterator.set_description(f"Loss={loss.item():.3f}")
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
+
+            epoch_iterator.set_description(f"Loss={loss.item():.3f}")
 
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -293,7 +297,8 @@ def train_reader(args):
 
                 # Save model checkpoint
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                    output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
+                    #output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
+                    output_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}-{args.gradient_accumulation_steps}grad-{args.learning_rate}lr".format(global_step))
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
 
@@ -320,6 +325,10 @@ def train_reader(args):
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
+
+    if args.local_rank in [-1, 0]:
+        args.test_path = "/n/fs/nlp-hyen/DensePhrases/outputs/dph-nqsqd-pb2_pq96-nq-10/pred/test_preprocessed_3610.pred"
+        eval_reader(args=args, model=model, tokenizer=tokenizer, config=config)
 
     return global_step, tr_loss / global_step
 
